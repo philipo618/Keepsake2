@@ -1,13 +1,17 @@
 import { LICENSED_MUSIC_LIBRARY } from './audioEngine';
+import { getLocalMediaBlob } from './indexedDbService';
 import type { MusicConfig } from './types';
 
 export interface RenderedAudioResult {
   buffer: AudioBuffer | null;
+  status: 'ok' | 'disabled' | 'failed';
+  sampleRate?: number;
   sourceDurationSec?: number;
   warning?: string;
+  errorDetail?: string;
 }
 
-const SAMPLE_RATE = 44100;
+export const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
 
 function getAudioContextClass(): typeof AudioContext | null {
   if (typeof window === 'undefined') return null;
@@ -22,7 +26,8 @@ function getOfflineAudioContextClass(): typeof OfflineAudioContext | null {
   if (typeof window === 'undefined') return null;
   return (
     window.OfflineAudioContext ||
-    (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext ||
+    (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
+      .webkitOfflineAudioContext ||
     null
   );
 }
@@ -34,9 +39,9 @@ function applyFadeEnvelope(
   fadeInSec: number,
   fadeOutSec: number
 ) {
-  const safeVol = Math.max(0.0001, Math.min(1, targetVolume));
-  const clampedFadeIn = Math.min(fadeInSec, totalDurationSec * 0.4);
-  const clampedFadeOut = Math.min(fadeOutSec, totalDurationSec * 0.4);
+  const safeVol = Math.max(0.01, Math.min(1, targetVolume));
+  const clampedFadeIn = Math.min(fadeInSec, totalDurationSec * 0.38);
+  const clampedFadeOut = Math.min(fadeOutSec, totalDurationSec * 0.38);
 
   if (clampedFadeIn > 0.05) {
     gainNode.gain.setValueAtTime(0.0001, 0);
@@ -48,48 +53,88 @@ function applyFadeEnvelope(
   const fadeOutStart = Math.max(clampedFadeIn, totalDurationSec - clampedFadeOut);
   if (clampedFadeOut > 0.05 && fadeOutStart < totalDurationSec) {
     gainNode.gain.setValueAtTime(safeVol, fadeOutStart);
-    gainNode.gain.linearRampToValueAtTime(0.0001, Math.max(fadeOutStart + 0.05, totalDurationSec - 0.02));
+    gainNode.gain.linearRampToValueAtTime(
+      0.0001,
+      Math.max(fadeOutStart + 0.05, totalDurationSec - 0.02)
+    );
   }
+}
+
+async function fetchOrLocalAudioBytes(musicConfig: MusicConfig): Promise<ArrayBuffer> {
+  if (musicConfig.localBlobId) {
+    try {
+      const localRec = await getLocalMediaBlob(musicConfig.localBlobId);
+      if (localRec?.blob && localRec.blob.size > 0) {
+        return await localRec.blob.arrayBuffer();
+      }
+    } catch {
+      // Fall through to remote fetch if IndexedDB blob is unavailable
+    }
+  }
+
+  if (!musicConfig.audioUrl) {
+    throw new Error('No audio URL or local audio file found.');
+  }
+
+  const resp = await fetch(musicConfig.audioUrl, { mode: 'cors' });
+  if (!resp.ok) {
+    throw new Error(`Audio download returned HTTP ${resp.status}.`);
+  }
+  const buf = await resp.arrayBuffer();
+  if (!buf || buf.byteLength < 64) {
+    throw new Error('Downloaded audio file was empty or corrupted.');
+  }
+  return buf;
 }
 
 export async function renderMusicToAudioBuffer(
   musicConfig: MusicConfig | undefined,
   audioOptions: { fadeInSec: number; fadeOutSec: number },
-  totalDurationSec: number
+  totalDurationSec: number,
+  targetSampleRate = DEFAULT_AUDIO_SAMPLE_RATE
 ): Promise<RenderedAudioResult> {
   if (!musicConfig?.enabled || musicConfig.sourceType === 'none') {
-    return { buffer: null };
+    return { buffer: null, status: 'disabled' };
   }
 
   const OfflineCtx = getOfflineAudioContextClass();
   const OnlineCtx = getAudioContextClass();
   if (!OfflineCtx || !OnlineCtx) {
+    const msg =
+      'Web Audio API is unavailable in this browser; synchronized audio export cannot run.';
     return {
       buffer: null,
-      warning: 'Web Audio API is unavailable in this browser; exporting video without audio track.',
+      status: 'failed',
+      warning: msg,
+      errorDetail: msg,
     };
   }
 
+  const safeSampleRate =
+    targetSampleRate === 44100 || targetSampleRate === 48000
+      ? targetSampleRate
+      : DEFAULT_AUDIO_SAMPLE_RATE;
   const safeDuration = Math.max(1, totalDurationSec);
-  const frameCount = Math.ceil(safeDuration * SAMPLE_RATE);
+  const frameCount = Math.ceil(safeDuration * safeSampleRate);
 
   // Uploaded / external audio path
-  if (musicConfig.sourceType === 'uploaded' && musicConfig.audioUrl) {
+  if (musicConfig.sourceType === 'uploaded' && (musicConfig.audioUrl || musicConfig.localBlobId)) {
     try {
-      const resp = await fetch(musicConfig.audioUrl, { mode: 'cors' });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const rawBytes = await resp.arrayBuffer();
-      const tempCtx = new OnlineCtx();
+      const rawBytes = await fetchOrLocalAudioBytes(musicConfig);
+      const tempCtx = new OnlineCtx({ sampleRate: safeSampleRate });
       let decoded: AudioBuffer;
       try {
-        decoded = await tempCtx.decodeAudioData(rawBytes);
+        // Slice to prevent detached-buffer issues across repeated exports
+        decoded = await tempCtx.decodeAudioData(rawBytes.slice(0));
       } finally {
         await tempCtx.close().catch(() => {});
       }
 
-      const offline = new OfflineCtx(2, frameCount, SAMPLE_RATE);
+      if (!decoded || decoded.duration <= 0.05 || decoded.length === 0) {
+        throw new Error('Decoded audio track has zero duration.');
+      }
+
+      const offline = new OfflineCtx(2, frameCount, safeSampleRate);
       const masterGain = offline.createGain();
       applyFadeEnvelope(
         masterGain,
@@ -122,12 +167,23 @@ export async function renderMusicToAudioBuffer(
       }
 
       const rendered = await offline.startRendering();
-      return { buffer: rendered, sourceDurationSec: Math.round(decoded.duration * 10) / 10 };
-    } catch {
+      return {
+        buffer: rendered,
+        status: 'ok',
+        sampleRate: rendered.sampleRate,
+        sourceDurationSec: Math.round(decoded.duration * 10) / 10,
+      };
+    } catch (err) {
+      const reason =
+        err instanceof Error
+          ? err.message
+          : 'Audio decode/CORS failure';
+      const msg = `Could not decode your uploaded/external music track (${reason}). Re-upload the audio file or select a Studio Library track so video export includes synchronized sound.`;
       return {
         buffer: null,
-        warning:
-          'Uploaded/external audio could not be decoded (possibly CORS-restricted or unsupported codec). Video will export silently.',
+        status: 'failed',
+        warning: msg,
+        errorDetail: msg,
       };
     }
   }
@@ -137,12 +193,12 @@ export async function renderMusicToAudioBuffer(
     LICENSED_MUSIC_LIBRARY.find((t) => t.id === musicConfig.trackId) || LICENSED_MUSIC_LIBRARY[0];
 
   try {
-    const offline = new OfflineCtx(2, frameCount, SAMPLE_RATE);
+    const offline = new OfflineCtx(2, frameCount, safeSampleRate);
     const masterGain = offline.createGain();
     applyFadeEnvelope(
       masterGain,
       safeDuration,
-      (musicConfig.volume ?? 0.65) * 0.45,
+      Math.max(0.2, (musicConfig.volume ?? 0.65) * 0.55),
       audioOptions.fadeInSec,
       audioOptions.fadeOutSec
     );
@@ -176,7 +232,7 @@ export async function renderMusicToAudioBuffer(
       harmonic.type = 'sine';
       harmonic.frequency.setValueAtTime(freq * 2, t);
       harmGain.gain.setValueAtTime(0.0001, t);
-      harmGain.gain.linearRampToValueAtTime(0.08, t + 0.04);
+      harmGain.gain.linearRampToValueAtTime(0.09, t + 0.04);
       harmGain.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.1, noteDuration * 0.85));
       harmonic.connect(harmGain);
       harmGain.connect(masterGain);
@@ -191,7 +247,7 @@ export async function renderMusicToAudioBuffer(
         padOsc.type = 'sine';
         padOsc.frequency.setValueAtTime(freq * 0.5, t);
         padGain.gain.setValueAtTime(0.0001, t);
-        padGain.gain.linearRampToValueAtTime(0.16, t + 0.15);
+        padGain.gain.linearRampToValueAtTime(0.18, t + 0.15);
         padGain.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.2, padDur));
         padOsc.connect(padGain);
         padGain.connect(masterGain);
@@ -204,11 +260,21 @@ export async function renderMusicToAudioBuffer(
     }
 
     const rendered = await offline.startRendering();
-    return { buffer: rendered };
-  } catch {
+    return {
+      buffer: rendered,
+      status: 'ok',
+      sampleRate: rendered.sampleRate,
+    };
+  } catch (err) {
+    const msg =
+      err instanceof Error
+        ? `Studio audio synthesis failed (${err.message}).`
+        : 'Studio audio synthesis encountered an unexpected error.';
     return {
       buffer: null,
-      warning: 'Studio audio synthesis encountered an error; video will export without audio.',
+      status: 'failed',
+      warning: msg,
+      errorDetail: msg,
     };
   }
 }
@@ -231,13 +297,16 @@ export class StudioAudioSyncPlayer {
     if (!Ctx) return;
 
     if (!this.ctx || this.ctx.state === 'closed') {
-      this.ctx = new Ctx();
+      this.ctx = new Ctx({ sampleRate: this.buffer.sampleRate });
     }
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume().catch(() => {});
     }
 
-    const clampedOffset = Math.max(0, Math.min(offsetSec, Math.max(0, this.buffer.duration - 0.05)));
+    const clampedOffset = Math.max(
+      0,
+      Math.min(offsetSec, Math.max(0, this.buffer.duration - 0.05))
+    );
     const source = this.ctx.createBufferSource();
     source.buffer = this.buffer;
 
@@ -254,7 +323,11 @@ export class StudioAudioSyncPlayer {
 
   setVolume(volume: number) {
     if (this.gainNode && this.ctx) {
-      this.gainNode.gain.setTargetAtTime(Math.max(0, Math.min(1, volume)), this.ctx.currentTime, 0.03);
+      this.gainNode.gain.setTargetAtTime(
+        Math.max(0, Math.min(1, volume)),
+        this.ctx.currentTime,
+        0.03
+      );
     }
   }
 

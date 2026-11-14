@@ -95,7 +95,15 @@ export function ShareModal({
           <div className="mb-4 rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/30 p-3 text-xs text-emerald-900 dark:text-emerald-200 flex items-start gap-2">
             <Lock className="w-4 h-4 shrink-0 mt-0.5" />
             <span>
-              <strong>Mode B Private Card (AES-256-GCM):</strong> The decryption key is embedded strictly inside the <code className="font-mono">#key=...</code> URL fragment and was never uploaded to Cloudinary. Share the full link—opening the card without the fragment key will be rejected.
+              {encryptionKey ? (
+                <>
+                  <strong>Mode B Private Card (AES-256-GCM):</strong> The decryption key is embedded inside the <code className="font-mono">#key=...</code> URL fragment. Share the full link with your recipient.
+                </>
+              ) : (
+                <>
+                  <strong>Mode B Private Card (PBKDF2 + AES-256-GCM):</strong> Your greeting is encrypted in the browser. The recipient unlocks it using their <strong>Age, Birth Month, and Birth Year</strong>—no answers or decryption keys are stored in plaintext.
+                </>
+              )}
             </span>
           </div>
         )}

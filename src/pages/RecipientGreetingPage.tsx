@@ -1,35 +1,42 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Gift, KeyRound, Lock, ShieldAlert } from 'lucide-react';
 import { GreetingExperience } from '../components/GreetingExperience';
 import { VerificationGate } from '../components/VerificationGate';
 import { fetchCardDocumentFromCloudinary } from '../lib/cloudinaryService';
 import {
   decryptModeBCardDocument,
+  decryptModeBCardDocumentV3,
+  isModeBV3Envelope,
   ModeBDecryptError,
   type ModeBDecryptErrorCode,
+  type ModeBPlaintextBundle,
 } from '../lib/cryptoVault';
 import type { AppRoute } from '../components/Navbar';
 import type {
+  AnyModeBEnvelope,
   CardDocumentV2Public,
   Greeting,
   ModeBEncryptedEnvelope,
+  ModeBEncryptedEnvelopeV3,
   VerificationSecretsInput,
 } from '../lib/types';
 
-function isEncryptedEnvelope(
-  doc: CardDocumentV2Public | ModeBEncryptedEnvelope | Greeting
+function isLegacyV2Envelope(
+  doc: CardDocumentV2Public | AnyModeBEnvelope | Greeting
 ): doc is ModeBEncryptedEnvelope {
   return (
     doc != null &&
     typeof doc === 'object' &&
     'accessMode' in doc &&
     doc.accessMode === 'interactive' &&
+    'schemaVersion' in doc &&
+    doc.schemaVersion === 2 &&
     'encryption' in doc
   );
 }
 
 function isPublicCardDocumentV2(
-  doc: CardDocumentV2Public | ModeBEncryptedEnvelope | Greeting
+  doc: CardDocumentV2Public | AnyModeBEnvelope | Greeting
 ): doc is CardDocumentV2Public {
   return (
     doc != null &&
@@ -49,6 +56,8 @@ export function RecipientGreetingPage({
   encryptionKeyFragment?: string | null;
   navigate: (next: AppRoute) => void;
 }) {
+  const [lockedEnvelopeV3, setLockedEnvelopeV3] = useState<ModeBEncryptedEnvelopeV3 | null>(null);
+  const pendingV3BundleRef = useRef<ModeBPlaintextBundle | null>(null);
   const [greeting, setGreeting] = useState<Greeting | null>(null);
   const [quizSecrets, setQuizSecrets] = useState<VerificationSecretsInput | undefined>(undefined);
   const [loading, setLoading] = useState(true);
@@ -62,6 +71,8 @@ export function RecipientGreetingPage({
     setErrorMsg('');
     setDecryptErrorCode(null);
     setVerified(false);
+    setLockedEnvelopeV3(null);
+    pendingV3BundleRef.current = null;
     setGreeting(null);
     setQuizSecrets(undefined);
 
@@ -70,8 +81,14 @@ export function RecipientGreetingPage({
         const fetched = await fetchCardDocumentFromCloudinary(greetingId);
         if (!active) return;
 
-        if (isEncryptedEnvelope(fetched)) {
-          // Strict Mode B client-side AES-256-GCM decryption using URL fragment #key=...
+        if (isModeBV3Envelope(fetched)) {
+          // Mode B V3: envelope remains encrypted until recipient enters Age + Birth Month + Birth Year
+          setLockedEnvelopeV3(fetched);
+          return;
+        }
+
+        if (isLegacyV2Envelope(fetched)) {
+          // Legacy Mode B V2 client-side AES-256-GCM decryption using URL fragment #key=...
           const decryptedBundle = await decryptModeBCardDocument(fetched, encryptionKeyFragment);
           if (!active) return;
           setGreeting(decryptedBundle.greeting);
@@ -90,7 +107,7 @@ export function RecipientGreetingPage({
           return;
         }
 
-        // Legacy / direct raw Greeting JSON
+        // Direct raw Greeting JSON fallback
         setGreeting(fetched as Greeting);
         setVerified(true);
       } catch (err) {
@@ -128,6 +145,39 @@ export function RecipientGreetingPage({
     );
   }
 
+  // Mode B V3 unlock gate (card payload stays encrypted until Age + Birth Month + Birth Year derive the key)
+  if (lockedEnvelopeV3 && !greeting) {
+    return (
+      <main className="min-h-[85vh] flex items-center justify-center px-4 py-8">
+        <VerificationGate
+          v3Mode
+          v3CardId={lockedEnvelopeV3.cardId}
+          v3Teaser={lockedEnvelopeV3.teaser}
+          v3Policy={{
+            maxRetries: lockedEnvelopeV3.kdf.maxRetries,
+            friendlyErrorMessage: lockedEnvelopeV3.kdf.friendlyErrorMessage,
+          }}
+          onUnlockWithBirthday={async (submitted) => {
+            const decryptedBundle = await decryptModeBCardDocumentV3(lockedEnvelopeV3, submitted);
+            pendingV3BundleRef.current = decryptedBundle;
+          }}
+          onVerified={() => {
+            const bundle = pendingV3BundleRef.current;
+            if (!bundle) return;
+            setGreeting(bundle.greeting);
+            if (bundle.interactiveQuiz) {
+              setQuizSecrets(bundle.interactiveQuiz.expectedSecrets);
+              setVerified(false);
+            } else {
+              setVerified(true);
+            }
+            setLockedEnvelopeV3(null);
+          }}
+        />
+      </main>
+    );
+  }
+
   if (errorMsg || !greeting) {
     const isCryptoLock = decryptErrorCode !== null;
     return (
@@ -152,10 +202,10 @@ export function RecipientGreetingPage({
           <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
             {errorMsg || 'This greeting link could not be loaded.'}
           </p>
-          {isCryptoLock && (
+          {isCryptoLock && (decryptErrorCode === 'MISSING_KEY' || decryptErrorCode === 'INVALID_KEY') && (
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Mode B cards are end-to-end encrypted in the browser. Ask the sender to resend the complete link including the{' '}
-              <code className="font-mono">#key=...</code> fragment.
+              Legacy encrypted cards require the complete link including the{' '}
+              <code className="font-mono">#key=...</code> fragment. Ask the sender to share the full URL.
             </p>
           )}
           <button

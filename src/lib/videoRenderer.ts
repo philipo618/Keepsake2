@@ -1,11 +1,11 @@
 import { ArrayBufferTarget, Muxer } from 'mp4-muxer';
+import { sanitizePresentationCaption } from './captionUtils';
 import { createDefaultVideoStudioConfig, resolvePhotoTransition, SLIDESHOW_STYLES } from './catalog';
-import { renderMusicToAudioBuffer } from './videoAudioPipeline';
+import { DEFAULT_AUDIO_SAMPLE_RATE, renderMusicToAudioBuffer } from './videoAudioPipeline';
 import type {
   AnimationEffectId,
   Greeting,
   PhotoItem,
-  PhotoPresentationLayout,
   PhotoTransitionType,
   TextAnimationStyle,
   VideoAspectRatio,
@@ -17,7 +17,7 @@ import type {
 
 export interface VideoScene {
   id: string;
-  kind: 'opening' | 'photo' | 'message' | 'note' | 'closing';
+  kind: 'opening' | 'celebration' | 'photo' | 'message' | 'note' | 'closing';
   label: string;
   startSec: number;
   endSec: number;
@@ -52,6 +52,9 @@ export interface ExportedVideoResult {
   width: number;
   height: number;
   sizeBytes: number;
+  hasAudioTrack: boolean;
+  audioCodec?: string;
+  videoCodec?: string;
   warnings: string[];
 }
 
@@ -122,7 +125,7 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
 
   // Group photos according to selected presentation layout so every single photo appears
   const presentation = config.photoPresentation;
-  const slideDur = Math.max(2.0, config.slideDurationSec || 4.0);
+  const slideDur = Math.max(1.5, config.slideDurationSec || 4.0);
 
   if (orderedPhotos.length > 0) {
     const groupSize =
@@ -138,6 +141,7 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
       const resolvedTx = resolvePhotoTransition(
         primary.transition || greeting.designConfig.defaultPhotoTransition || stylePreset.defaultTransition
       );
+      const cleanHeading = sanitizePresentationCaption(primary.caption) || undefined;
       rawScenes.push({
         id: `scene-photo-${i}`,
         kind: 'photo',
@@ -147,11 +151,33 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
             : `Memory ${i + 1} of ${orderedPhotos.length}`,
         durationSec: group.length > 1 ? Math.max(slideDur, slideDur * 1.15) : slideDur,
         photos: group,
-        heading: primary.caption || undefined,
-        subline: primary.attribution ? `${primary.attribution}` : undefined,
+        heading: cleanHeading,
+        subline:
+          primary.sourceType !== 'uploaded' && primary.attribution
+            ? `${primary.attribution}`
+            : undefined,
         transition: resolvedTx,
       });
     }
+  }
+
+  // Dedicated interactive celebration moment when cake / candle / cake-cutting animations are enabled
+  const anims = greeting.animations || [];
+  const hasCakeMoment =
+    anims.includes('animated-cake') ||
+    anims.includes('candle-effects') ||
+    anims.includes('cake-cutting');
+  if (hasCakeMoment) {
+    rawScenes.push({
+      id: 'scene-celebration',
+      kind: 'celebration',
+      label: anims.includes('cake-cutting') ? 'Cake Celebration' : 'Birthday Wish',
+      durationSec: 4.0,
+      photos: [],
+      heading: anims.includes('cake-cutting') ? 'Cut the Celebration Cake' : 'Make a Birthday Wish',
+      body: greeting.recipientName ? `Happy Moments, ${greeting.recipientName}` : 'Celebrate Today',
+      transition: 'dissolve',
+    });
   }
 
   // Main message scene
@@ -160,7 +186,7 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
       id: 'scene-main-message',
       kind: 'message',
       label: 'Personal Message',
-      durationSec: Math.max(2.5, config.textStyle.displayDurationSec || 4.5),
+      durationSec: Math.max(2.0, config.textStyle.displayDurationSec || 4.5),
       photos: orderedPhotos.length > 0 ? [orderedPhotos[orderedPhotos.length - 1]] : [],
       heading: greeting.title,
       body: greeting.mainMessage,
@@ -177,7 +203,7 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
       id: `scene-note-${idx}`,
       kind: 'note',
       label: `Personal Note ${idx + 1}`,
-      durationSec: Math.max(2.5, Math.min(6, (config.textStyle.displayDurationSec || 4) * 0.85)),
+      durationSec: Math.max(2.0, Math.min(6, (config.textStyle.displayDurationSec || 4) * 0.85)),
       photos: orderedPhotos.length > 0 ? [orderedPhotos[idx % orderedPhotos.length]] : [],
       heading: `Note for ${greeting.recipientName || 'You'}`,
       body: note,
@@ -218,22 +244,30 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
   }
 
   const naturalTotal = rawScenes.reduce((sum, s) => sum + s.durationSec, 0);
-  const scaleFactor =
-    config.customTotalDurationSec && config.customTotalDurationSec >= 4
-      ? config.customTotalDurationSec / naturalTotal
-      : 1;
+  const hasTargetTotal =
+    typeof config.customTotalDurationSec === 'number' &&
+    Number.isFinite(config.customTotalDurationSec) &&
+    config.customTotalDurationSec >= 5;
+  const targetTotal = hasTargetTotal
+    ? Math.max(5, Math.min(600, Number(config.customTotalDurationSec)))
+    : naturalTotal;
+
+  // Proportional scaling across ALL scenes without ever dropping scenes or exceeding targetTotal
+  const rawScaled = rawScenes.map((s) => (s.durationSec / naturalTotal) * targetTotal);
+  const floorPerScene = Math.min(0.45, targetTotal / rawScenes.length);
+  const clamped = rawScaled.map((d) => Math.max(floorPerScene, d));
+  const clampedSum = clamped.reduce((a, b) => a + b, 0);
+  const normalizeFactor = clampedSum > 0 ? targetTotal / clampedSum : 1;
 
   let cursor = 0;
   const scenes: VideoScene[] = rawScenes.map((s, idx) => {
-    const dur = Math.max(1.2, s.durationSec * scaleFactor);
     const startSec = cursor;
-    const endSec = idx === rawScenes.length - 1 && config.customTotalDurationSec
-      ? config.customTotalDurationSec
-      : startSec + dur;
+    const dur = clamped[idx] * normalizeFactor;
+    const endSec = idx === rawScenes.length - 1 ? targetTotal : startSec + dur;
     cursor = endSec;
     return {
       ...s,
-      durationSec: endSec - startSec,
+      durationSec: Math.max(0.1, endSec - startSec),
       startSec,
       endSec,
     };
@@ -241,8 +275,24 @@ export function buildVideoTimeline(greeting: Greeting, rawConfig?: VideoStudioCo
 
   return {
     scenes,
-    totalDurationSec: Math.max(1, scenes[scenes.length - 1]?.endSec || naturalTotal),
+    totalDurationSec: Math.max(1, scenes[scenes.length - 1]?.endSec || targetTotal),
   };
+}
+
+export function getTimelinePacingWarning(
+  timeline: VideoTimeline,
+  resolution: VideoResolution
+): string | null {
+  if (timeline.scenes.length > 0) {
+    const avgSec = timeline.totalDurationSec / timeline.scenes.length;
+    if (avgSec < 0.75) {
+      return `With ${timeline.scenes.length} scenes in ${timeline.totalDurationSec.toFixed(0)}s, each scene plays for ~${avgSec.toFixed(1)}s. Choose a longer duration if you prefer slower pacing.`;
+    }
+  }
+  if (resolution === '1080p' && timeline.totalDurationSec > 90) {
+    return `1080p exports longer than 90s require substantial browser memory. Consider 720p for smooth rendering on all devices.`;
+  }
+  return null;
 }
 
 function loadBitmapElement(url: string): Promise<HTMLImageElement> {
@@ -753,12 +803,13 @@ function drawStyledPhotoFrame(
     }
     ctx.restore();
 
-    if (photo.caption) {
+    const cleanCaption = sanitizePresentationCaption(photo.caption);
+    if (cleanCaption) {
       ctx.fillStyle = '#1E293B';
       ctx.font = `600 ${Math.max(14, Math.round(box.h * 0.042))}px "Caveat", Georgia, cursive`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(photo.caption.slice(0, 48), box.x + box.w / 2, box.y + box.h - bottomPad * 0.48, box.w - pad * 2);
+      ctx.fillText(cleanCaption.slice(0, 48), box.x + box.w / 2, box.y + box.h - bottomPad * 0.48, box.w - pad * 2);
     }
     ctx.restore();
     return;
@@ -776,17 +827,18 @@ function drawStyledPhotoFrame(
   ctx.clip();
 
   if (source) {
-    // Aspect-ratio safe fill: optional blurred backdrop when image aspect differs significantly or blurBackdrop is active
-    if (config.photoFrame.blurBackdrop) {
+    const imgRatio = source.width / Math.max(1, source.height);
+    const boxRatio = box.w / Math.max(1, box.h);
+    const ratioMismatch = Math.max(imgRatio / boxRatio, boxRatio / imgRatio);
+
+    // Aspect-ratio safe fill: always avoid awkward cropping or distortion when aspect ratios differ
+    if (config.photoFrame.blurBackdrop || ratioMismatch > 1.35) {
       ctx.save();
-      ctx.filter = 'blur(26px) brightness(0.65)';
+      ctx.filter = 'blur(26px) brightness(0.62)';
       drawCroppedPhotoIntoRect(ctx, source, photo, box.x - 24, box.y - 24, box.w + 48, box.h + 48, 'cover', 1.15);
       ctx.restore();
 
-      const imgRatio = source.width / Math.max(1, source.height);
-      const boxRatio = box.w / Math.max(1, box.h);
-      const ratioMismatch = Math.max(imgRatio / boxRatio, boxRatio / imgRatio);
-      const fitMode = ratioMismatch > 1.38 ? 'contain' : 'cover';
+      const fitMode = ratioMismatch > 1.32 ? 'contain' : 'cover';
       drawCroppedPhotoIntoRect(ctx, source, photo, box.x, box.y, box.w, box.h, fitMode, extraZoom, panX, panY);
     } else {
       drawCroppedPhotoIntoRect(ctx, source, photo, box.x, box.y, box.w, box.h, 'cover', extraZoom, panX, panY);
@@ -800,7 +852,8 @@ function drawStyledPhotoFrame(
     ctx.fillStyle = 'rgba(255,255,255,0.85)';
     ctx.textAlign = 'center';
     ctx.font = `500 ${Math.max(16, Math.round(box.h * 0.05))}px sans-serif`;
-    ctx.fillText(photo.caption || 'Memory Photograph', box.x + box.w / 2, box.y + box.h / 2, box.w * 0.85);
+    const fallbackLabel = sanitizePresentationCaption(photo.caption) || 'Keepsake Memory';
+    ctx.fillText(fallbackLabel, box.x + box.w / 2, box.y + box.h / 2, box.w * 0.85);
   }
   ctx.restore();
 
@@ -1138,6 +1191,8 @@ export function renderVideoFrame(
       ctx.fillText(scene.body, width / 2, height * 0.63, width * 0.75);
     }
     ctx.restore();
+  } else if (scene.kind === 'celebration') {
+    drawCelebrationCakeScene(ctx, width, height, scene, sceneProgress, accent, textColor, fonts.display, isLightThemeStyle, greeting.animations || [], reducedMotion);
   } else if (scene.kind === 'message' || scene.kind === 'note') {
     if (scene.photos[0]) {
       const src = imageCache.images.get(scene.photos[0].url);
@@ -1442,7 +1497,8 @@ export function renderVideoFrame(
     ctx.restore();
 
     // Scene caption overlay (skip duplicate caption if Polaroid already printed it nicely on the white mat)
-    if (scene.heading && presentation !== 'polaroid') {
+    const sanitizedHeading = sanitizePresentationCaption(scene.heading);
+    if (sanitizedHeading && presentation !== 'polaroid') {
       const capY =
         config.textStyle.position === 'top'
           ? pad * 0.9
@@ -1461,7 +1517,7 @@ export function renderVideoFrame(
       ctx.restore();
 
       const capSize = Math.round(Math.min(width, height) * 0.036);
-      drawAnimatedTextBlock(ctx, scene.heading, {
+      drawAnimatedTextBlock(ctx, sanitizedHeading, {
         x: width / 2,
         y: capY,
         maxWidth: width * 0.82,
@@ -1475,6 +1531,11 @@ export function renderVideoFrame(
         shadow: true,
       });
     }
+  }
+
+  // Optional festive bunting banner across top corners without obstructing faces/text
+  if ((greeting.animations || []).includes('birthday-bunting')) {
+    drawBirthdayBunting(ctx, width, height, safeTime, accent, reducedMotion);
   }
 
   // 3. Slideshow Style Chrome Overlays (Film Memories sprockets / Cinematic letterbox)
@@ -1507,6 +1568,259 @@ export function renderVideoFrame(
   }
 }
 
+function drawBirthdayBunting(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  timeSec: number,
+  accent: string,
+  reducedMotion: boolean
+) {
+  const colors = [accent, '#F59E0B', '#EC4899', '#38BDF8', '#10B981'];
+  const count = Math.max(10, Math.round(width / 82));
+  const sag = Math.min(height * 0.07, 46);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i <= 32; i++) {
+    const u = i / 32;
+    const x = u * width;
+    const y = Math.sin(u * Math.PI) * sag + 6;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  const flagW = width / count;
+  const flagH = Math.max(18, Math.min(34, height * 0.048));
+  for (let i = 0; i < count; i++) {
+    const u = (i + 0.5) / count;
+    const cx = u * width;
+    const cy = Math.sin(u * Math.PI) * sag + 6;
+    const sway = reducedMotion ? 0 : Math.sin(timeSec * 2.4 + i * 0.7) * 0.08;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(sway);
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.globalAlpha = 0.88;
+    ctx.beginPath();
+    ctx.moveTo(-flagW * 0.34, 0);
+    ctx.lineTo(flagW * 0.34, 0);
+    ctx.lineTo(0, flagH);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawCelebrationCakeScene(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  scene: VideoScene,
+  progress: number,
+  accent: string,
+  textColor: string,
+  displayFont: string,
+  isLightThemeStyle: boolean,
+  animations: AnimationEffectId[],
+  reducedMotion: boolean
+) {
+  const hasCandles =
+    animations.includes('animated-cake') || animations.includes('candle-effects');
+  const hasCutting = animations.includes('cake-cutting');
+
+  const cx = width * 0.5;
+  const baseY = height * 0.74;
+  const cakeW = Math.min(width * 0.44, height * 0.62);
+  const tier1H = cakeW * 0.28;
+  const tier2W = cakeW * 0.7;
+  const tier2H = cakeW * 0.22;
+
+  const p = reducedMotion ? 1 : progress;
+  // Candle blow-out timing: flames lit 0..0.52, extinguish 0.52..0.68, smoke 0.55..0.98
+  const flameScale =
+    !hasCandles
+      ? 0
+      : p < 0.52
+      ? 1
+      : p < 0.68
+      ? Math.max(0, 1 - (p - 0.52) / 0.16)
+      : 0;
+  const smokeFrac = hasCandles && p >= 0.54 ? Math.min(1, (p - 0.54) / 0.44) : 0;
+  // Cake cut timing: knife lowers 0.22..0.52, slice separates 0.54..0.88
+  const cutKnifeFrac = hasCutting ? Math.max(0, Math.min(1, (p - 0.22) / 0.3)) : 0;
+  const sliceOutFrac = hasCutting ? easeOutCubic(Math.max(0, Math.min(1, (p - 0.54) / 0.34))) : 0;
+
+  // Ambient candlelight halo when flames are lit
+  if (flameScale > 0.05) {
+    const halo = ctx.createRadialGradient(
+      cx,
+      baseY - tier1H - tier2H - 36,
+      10,
+      cx,
+      baseY - tier1H - tier2H - 20,
+      cakeW * 0.95
+    );
+    halo.addColorStop(0, `rgba(251, 191, 36, ${0.32 * flameScale})`);
+    halo.addColorStop(1, 'transparent');
+    ctx.fillStyle = halo;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  // Cake title heading
+  ctx.save();
+  const titleSize = Math.round(Math.min(width, height) * 0.054);
+  ctx.font = `700 ${titleSize}px ${displayFont}`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = isLightThemeStyle ? textColor : '#FFFFFF';
+  ctx.fillText(scene.heading || 'Make a Wish', cx, height * 0.16, width * 0.85);
+  if (scene.body) {
+    ctx.font = `500 ${Math.round(titleSize * 0.48)}px sans-serif`;
+    ctx.fillStyle = accent;
+    ctx.fillText(scene.body, cx, height * 0.24, width * 0.8);
+  }
+  ctx.restore();
+
+  // Cake pedestal stand
+  ctx.save();
+  ctx.fillStyle = '#E2E8F0';
+  roundedRectPath(ctx, cx - cakeW * 0.62, baseY, cakeW * 1.24, 14, 7);
+  ctx.fill();
+  ctx.fillStyle = '#CBD5E1';
+  ctx.fillRect(cx - cakeW * 0.09, baseY + 14, cakeW * 0.18, 22);
+  roundedRectPath(ctx, cx - cakeW * 0.28, baseY + 34, cakeW * 0.56, 10, 5);
+  ctx.fill();
+
+  // Bottom tier (if cutting, draw main body + sliding separated slice)
+  const sliceShiftX = sliceOutFrac * (cakeW * 0.24);
+  const sliceShiftY = sliceOutFrac * 12;
+
+  const drawTier = (tx: number, ty: number, tw: number, th: number, bodyColor: string, icingColor: string) => {
+    roundedRectPath(ctx, tx, ty, tw, th, 14);
+    ctx.fillStyle = bodyColor;
+    ctx.fill();
+    // Frosting top cap with gentle scallops
+    ctx.fillStyle = icingColor;
+    roundedRectPath(ctx, tx - 2, ty - 2, tw + 4, Math.max(14, th * 0.32), 10);
+    ctx.fill();
+  };
+
+  drawTier(cx - cakeW / 2, baseY - tier1H, cakeW, tier1H, '#FDE68A', '#FFFDF9');
+  drawTier(cx - tier2W / 2, baseY - tier1H - tier2H, tier2W, tier2H, accent, '#FFE4E6');
+
+  // Separated cut slice reveal
+  if (hasCutting && sliceOutFrac > 0.02) {
+    ctx.save();
+    ctx.translate(sliceShiftX, sliceShiftY);
+    const sliceW = cakeW * 0.22;
+    const sx = cx + cakeW * 0.28;
+    const sy = baseY - tier1H;
+    roundedRectPath(ctx, sx, sy, sliceW, tier1H, 8);
+    ctx.fillStyle = '#FCD34D';
+    ctx.fill();
+    // Sponge & cream layer stripe inside exposed cut slice
+    ctx.fillStyle = '#FFFDF9';
+    ctx.fillRect(sx + 2, sy + tier1H * 0.44, sliceW - 4, Math.max(6, tier1H * 0.16));
+    roundedRectPath(ctx, sx - 1, sy - 2, sliceW + 2, Math.max(12, tier1H * 0.28), 6);
+    ctx.fillStyle = '#FFE4E6';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Animated knife during cake-cutting
+  if (hasCutting && p > 0.16 && p < 0.72) {
+    const knifeTopY = baseY - tier1H - tier2H - 90;
+    const knifeEndY = baseY - tier1H * 0.35;
+    const ky = knifeTopY + easeInOutSine(cutKnifeFrac) * (knifeEndY - knifeTopY);
+    const kx = cx + cakeW * 0.24;
+    ctx.save();
+    ctx.translate(kx, ky);
+    ctx.rotate(-0.22 + cutKnifeFrac * 0.15);
+    // Blade
+    ctx.fillStyle = '#F8FAFC';
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(68, -6);
+    ctx.lineTo(68, 8);
+    ctx.lineTo(10, 10);
+    ctx.closePath();
+    ctx.fill();
+    // Handle
+    roundedRectPath(ctx, 68, -6, 36, 13, 4);
+    ctx.fillStyle = '#1E293B';
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Candles & flames + smoke curls
+  if (hasCandles) {
+    const candleOffsets = [-0.28, -0.14, 0, 0.14, 0.28];
+    const topY = baseY - tier1H - tier2H;
+    const candleH = Math.max(28, tier2H * 0.72);
+    const candleW = Math.max(7, tier2W * 0.045);
+
+    candleOffsets.forEach((off, idx) => {
+      const candleX = cx + off * tier2W;
+      const candleY = topY - candleH;
+      roundedRectPath(ctx, candleX - candleW / 2, candleY, candleW, candleH, 3);
+      ctx.fillStyle = idx % 2 === 0 ? '#FFF1F2' : '#FDE68A';
+      ctx.fill();
+      // Wick
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(candleX, candleY);
+      ctx.lineTo(candleX, candleY - 6);
+      ctx.stroke();
+
+      if (flameScale > 0.02) {
+        const flicker = reducedMotion ? 0 : Math.sin(progress * 26 + idx * 1.9) * 2.2;
+        const fh = 18 * flameScale;
+        const fw = 7 * flameScale;
+        ctx.save();
+        ctx.translate(candleX + flicker * 0.5, candleY - 7);
+        ctx.fillStyle = '#F59E0B';
+        ctx.beginPath();
+        ctx.ellipse(0, -fh * 0.5, fw, fh * 0.65, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#FEF08A';
+        ctx.beginPath();
+        ctx.ellipse(0, -fh * 0.35, fw * 0.55, fh * 0.4, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      if (smokeFrac > 0.02 && smokeFrac < 1) {
+        ctx.save();
+        ctx.globalAlpha = (1 - smokeFrac) * 0.6;
+        ctx.strokeStyle = '#CBD5E1';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        const rise = smokeFrac * 54;
+        ctx.moveTo(candleX, candleY - 8);
+        ctx.quadraticCurveTo(
+          candleX + Math.sin(smokeFrac * 8 + idx) * 12,
+          candleY - 8 - rise * 0.5,
+          candleX + Math.cos(smokeFrac * 6 + idx) * 8,
+          candleY - 8 - rise
+        );
+        ctx.stroke();
+        ctx.restore();
+      }
+    });
+  }
+
+  ctx.restore();
+}
+
+export interface ResolutionCapability {
+  supported: boolean;
+  reason?: string;
+}
+
 export interface BrowserVideoCapabilities {
   webCodecsMp4: boolean;
   mediaRecorderMp4: boolean;
@@ -1514,16 +1828,23 @@ export interface BrowserVideoCapabilities {
   webmMimeType: string;
   mp4MimeType: string;
   preferredWebCodecsVideoCodec: string | null;
+  preferredAudioSampleRate: 48000 | 44100;
+  resolutionSupport: Record<VideoResolution, ResolutionCapability>;
 }
 
-const WEBM_MIME_CANDIDATES = [
+const WEBM_AUDIO_MIME_CANDIDATES = [
   'video/webm;codecs=vp9,opus',
   'video/webm;codecs=vp8,opus',
-  'video/webm;codecs=vp9',
   'video/webm',
 ];
 
-const MP4_MIME_CANDIDATES = [
+const WEBM_VIDEO_ONLY_CANDIDATES = [
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=vp8',
+  'video/webm',
+];
+
+const MP4_AUDIO_MIME_CANDIDATES = [
   'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
   'video/mp4;codecs=avc1.4d002a,mp4a.40.2',
   'video/mp4',
@@ -1536,50 +1857,70 @@ const WEBCODECS_H264_PROFILES = [
   'avc1.42E01E', // Constrained Baseline L3.0
 ];
 
-export function getSupportedBrowserMimeType(preferredFormat?: VideoExportFormat): {
+export function getSupportedBrowserMimeType(
+  preferredFormat?: VideoExportFormat,
+  needsAudio = true
+): {
   mimeType: string;
   nativeMp4: boolean;
+  supportsAudio: boolean;
 } {
   if (typeof MediaRecorder === 'undefined') {
-    return { mimeType: '', nativeMp4: false };
+    return { mimeType: '', nativeMp4: false, supportsAudio: false };
   }
   if (preferredFormat === 'mp4') {
-    for (const candidate of MP4_MIME_CANDIDATES) {
+    for (const candidate of MP4_AUDIO_MIME_CANDIDATES) {
       if (MediaRecorder.isTypeSupported(candidate)) {
-        return { mimeType: candidate, nativeMp4: true };
+        return { mimeType: candidate, nativeMp4: true, supportsAudio: true };
       }
     }
   }
-  for (const candidate of WEBM_MIME_CANDIDATES) {
+  for (const candidate of WEBM_AUDIO_MIME_CANDIDATES) {
     if (MediaRecorder.isTypeSupported(candidate)) {
-      return { mimeType: candidate, nativeMp4: false };
+      return {
+        mimeType: candidate,
+        nativeMp4: false,
+        supportsAudio: candidate.includes('opus') || candidate === 'video/webm',
+      };
     }
   }
-  for (const candidate of MP4_MIME_CANDIDATES) {
-    if (MediaRecorder.isTypeSupported(candidate)) {
-      return { mimeType: candidate, nativeMp4: true };
+  if (!needsAudio) {
+    for (const candidate of WEBM_VIDEO_ONLY_CANDIDATES) {
+      if (MediaRecorder.isTypeSupported(candidate)) {
+        return { mimeType: candidate, nativeMp4: false, supportsAudio: false };
+      }
     }
   }
-  return { mimeType: '', nativeMp4: false };
+  for (const candidate of MP4_AUDIO_MIME_CANDIDATES) {
+    if (MediaRecorder.isTypeSupported(candidate)) {
+      return { mimeType: candidate, nativeMp4: true, supportsAudio: true };
+    }
+  }
+  return { mimeType: '', nativeMp4: false, supportsAudio: false };
 }
 
 export async function detectBrowserVideoCapabilities(
   width = 1280,
   height = 720,
   fps = 30,
-  needsAudio = true
+  needsAudio = true,
+  aspectRatio: VideoAspectRatio = '16:9',
+  quality: VideoQuality = 'high'
 ): Promise<BrowserVideoCapabilities> {
   let webmMimeType = '';
   let mp4MimeType = '';
 
   if (typeof MediaRecorder !== 'undefined') {
-    for (const c of WEBM_MIME_CANDIDATES) {
+    const webmPool = needsAudio
+      ? WEBM_AUDIO_MIME_CANDIDATES
+      : [...WEBM_AUDIO_MIME_CANDIDATES, ...WEBM_VIDEO_ONLY_CANDIDATES];
+    for (const c of webmPool) {
       if (MediaRecorder.isTypeSupported(c)) {
         webmMimeType = c;
         break;
       }
     }
-    for (const c of MP4_MIME_CANDIDATES) {
+    for (const c of MP4_AUDIO_MIME_CANDIDATES) {
       if (MediaRecorder.isTypeSupported(c)) {
         mp4MimeType = c;
         break;
@@ -1589,33 +1930,41 @@ export async function detectBrowserVideoCapabilities(
 
   let preferredWebCodecsVideoCodec: string | null = null;
   let webCodecsAudioOk = !needsAudio;
+  let preferredAudioSampleRate: 48000 | 44100 = DEFAULT_AUDIO_SAMPLE_RATE;
 
   const hasWebCodecs =
     typeof VideoEncoder !== 'undefined' &&
     typeof VideoFrame !== 'undefined' &&
     (!needsAudio || (typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined'));
 
-  if (hasWebCodecs) {
+  const probeWebCodecsForDims = async (w: number, h: number, bps: number): Promise<string | null> => {
+    if (!hasWebCodecs) return null;
     for (const codec of WEBCODECS_H264_PROFILES) {
       try {
         const support = await VideoEncoder.isConfigSupported({
           codec,
-          width,
-          height,
-          bitrate: 4_200_000,
+          width: w,
+          height: h,
+          bitrate: bps,
           framerate: fps,
         });
-        if (support.supported) {
-          preferredWebCodecsVideoCodec = codec;
-          break;
-        }
+        if (support.supported) return codec;
       } catch {
-        // Probe next H.264 profile
+        // Probe next profile
       }
     }
+    return null;
+  };
+
+  if (hasWebCodecs) {
+    preferredWebCodecsVideoCodec = await probeWebCodecsForDims(
+      width,
+      height,
+      getBitrateBps(height >= 1080 || width >= 1920 ? '1080p' : '720p', quality)
+    );
 
     if (preferredWebCodecsVideoCodec && needsAudio) {
-      for (const sampleRate of [48000, 44100]) {
+      for (const sampleRate of [48000, 44100] as const) {
         try {
           const audioSupport = await AudioEncoder.isConfigSupported({
             codec: 'mp4a.40.2',
@@ -1625,6 +1974,7 @@ export async function detectBrowserVideoCapabilities(
           });
           if (audioSupport.supported) {
             webCodecsAudioOk = true;
+            preferredAudioSampleRate = sampleRate;
             break;
           }
         } catch {
@@ -1634,6 +1984,36 @@ export async function detectBrowserVideoCapabilities(
     }
   }
 
+  const deviceMemGb =
+    typeof navigator !== 'undefined' && 'deviceMemory' in navigator
+      ? Number((navigator as unknown as { deviceMemory?: number }).deviceMemory || 0)
+      : 0;
+  const hasRecorderOrWebCodecs =
+    Boolean(preferredWebCodecsVideoCodec && webCodecsAudioOk) ||
+    Boolean(webmMimeType) ||
+    Boolean(mp4MimeType);
+
+  const dims1080 = getExportDimensions(aspectRatio, '1080p');
+  const codec1080 = await probeWebCodecsForDims(
+    dims1080.width,
+    dims1080.height,
+    getBitrateBps('1080p', quality)
+  );
+  const lowMemoryDevice = deviceMemGb > 0 && deviceMemGb <= 2;
+  const supports1080p =
+    hasRecorderOrWebCodecs &&
+    !lowMemoryDevice &&
+    (Boolean(codec1080 && webCodecsAudioOk) || Boolean(webmMimeType) || Boolean(mp4MimeType));
+
+  let reason1080p: string | undefined;
+  if (!hasRecorderOrWebCodecs) {
+    reason1080p = 'No browser video encoder is available on this device.';
+  } else if (lowMemoryDevice) {
+    reason1080p = `1080p disabled: device reports ${deviceMemGb} GB RAM, which risks browser memory failure.`;
+  } else if (!codec1080 && !webmMimeType && !mp4MimeType) {
+    reason1080p = 'Hardware 1080p encoder unsupported on this browser.';
+  }
+
   return {
     webCodecsMp4: Boolean(preferredWebCodecsVideoCodec && webCodecsAudioOk),
     mediaRecorderMp4: Boolean(mp4MimeType),
@@ -1641,27 +2021,145 @@ export async function detectBrowserVideoCapabilities(
     webmMimeType,
     mp4MimeType,
     preferredWebCodecsVideoCodec,
+    preferredAudioSampleRate,
+    resolutionSupport: {
+      '480p': {
+        supported: hasRecorderOrWebCodecs,
+        reason: hasRecorderOrWebCodecs ? undefined : 'Browser video export unavailable.',
+      },
+      '720p': {
+        supported: hasRecorderOrWebCodecs,
+        reason: hasRecorderOrWebCodecs ? undefined : 'Browser video export unavailable.',
+      },
+      '1080p': {
+        supported: supports1080p,
+        reason: reason1080p,
+      },
+    },
   };
+}
+
+/**
+ * Inspects binary MP4 (ISO BMFF) or WebM (EBML/Matroska) container bytes for video & audio tracks.
+ */
+export function inspectVideoContainerTracks(
+  bytes: Uint8Array,
+  format: VideoExportFormat
+): {
+  validHeader: boolean;
+  hasVideoTrack: boolean;
+  hasAudioTrack: boolean;
+  videoCodec?: string;
+  audioCodec?: string;
+} {
+  if (!bytes || bytes.byteLength < 32) {
+    return { validHeader: false, hasVideoTrack: false, hasAudioTrack: false };
+  }
+
+  if (format === 'mp4') {
+    const ftyp = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    if (ftyp !== 'ftyp') {
+      return { validHeader: false, hasVideoTrack: false, hasAudioTrack: false };
+    }
+    const ascii = new TextDecoder('latin1').decode(bytes);
+    const hasVideoTrack = ascii.includes('vide') || ascii.includes('avc1') || ascii.includes('hev1') || ascii.includes('mp4v');
+    const hasAudioTrack = ascii.includes('soun') || ascii.includes('mp4a') || ascii.includes('Opus');
+    const audioCodec = ascii.includes('mp4a')
+      ? 'AAC (mp4a)'
+      : ascii.includes('Opus')
+      ? 'Opus'
+      : hasAudioTrack
+      ? 'Audio Track'
+      : undefined;
+    const videoCodec = ascii.includes('avc1')
+      ? 'H.264 (avc1)'
+      : ascii.includes('hev1')
+      ? 'H.265'
+      : hasVideoTrack
+      ? 'Video Track'
+      : undefined;
+    return { validHeader: true, hasVideoTrack, hasAudioTrack, videoCodec, audioCodec };
+  }
+
+  // WebM EBML header 0x1A 0x45 0xDF 0xA3
+  if (bytes[0] !== 0x1a || bytes[1] !== 0x45 || bytes[2] !== 0xdf || bytes[3] !== 0xa3) {
+    return { validHeader: false, hasVideoTrack: false, hasAudioTrack: false };
+  }
+  const ascii = new TextDecoder('latin1').decode(bytes);
+  const hasVideoTrack = ascii.includes('V_VP9') || ascii.includes('V_VP8') || ascii.includes('V_AV1') || ascii.includes('V_MPEG4');
+  const hasAudioTrack = ascii.includes('A_OPUS') || ascii.includes('A_VORBIS') || ascii.includes('A_AAC');
+  const videoCodec = ascii.includes('V_VP9')
+    ? 'VP9'
+    : ascii.includes('V_VP8')
+    ? 'VP8'
+    : ascii.includes('V_AV1')
+    ? 'AV1'
+    : undefined;
+  const audioCodec = ascii.includes('A_OPUS')
+    ? 'Opus'
+    : ascii.includes('A_VORBIS')
+    ? 'Vorbis'
+    : ascii.includes('A_AAC')
+    ? 'AAC'
+    : undefined;
+  return { validHeader: true, hasVideoTrack, hasAudioTrack, videoCodec, audioCodec };
 }
 
 export async function verifyVideoBlobContainerAndPlayability(
   blob: Blob,
-  expectedFormat: VideoExportFormat
-): Promise<{ valid: boolean; durationSec: number; reason?: string }> {
+  expectedFormat: VideoExportFormat,
+  requireAudio = false
+): Promise<{
+  valid: boolean;
+  durationSec: number;
+  hasAudioTrack: boolean;
+  audioCodec?: string;
+  videoCodec?: string;
+  reason?: string;
+}> {
   if (!blob || blob.size < 128) {
-    return { valid: false, durationSec: 0, reason: 'Exported file is empty or truncated.' };
+    return {
+      valid: false,
+      durationSec: 0,
+      hasAudioTrack: false,
+      reason: 'Exported file is empty or truncated.',
+    };
   }
-  const headerBuf = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
-  if (expectedFormat === 'mp4') {
-    const ftyp = String.fromCharCode(headerBuf[4], headerBuf[5], headerBuf[6], headerBuf[7]);
-    if (ftyp !== 'ftyp') {
-      return { valid: false, durationSec: 0, reason: 'Exported output did not pass MP4 container signature check.' };
+
+  const headSliceSize = Math.min(blob.size, 256 * 1024);
+  const headBytes = new Uint8Array(await blob.slice(0, headSliceSize).arrayBuffer());
+  let tracks = inspectVideoContainerTracks(headBytes, expectedFormat);
+
+  // If MP4 moov atom is placed near EOF (streaming MediaRecorder), also scan the tail chunk
+  if (expectedFormat === 'mp4' && !tracks.hasAudioTrack && blob.size > headSliceSize) {
+    const tailStart = Math.max(0, blob.size - 256 * 1024);
+    const tailBytes = new Uint8Array(await blob.slice(tailStart).arrayBuffer());
+    const tailAscii = new TextDecoder('latin1').decode(tailBytes);
+    if (tailAscii.includes('soun') || tailAscii.includes('mp4a')) {
+      tracks = {
+        ...tracks,
+        hasAudioTrack: true,
+        audioCodec: tailAscii.includes('mp4a') ? 'AAC (mp4a)' : 'Audio Track',
+      };
     }
-  } else {
-    // EBML header 0x1A 0x45 0xDF 0xA3
-    if (headerBuf[0] !== 0x1a || headerBuf[1] !== 0x45 || headerBuf[2] !== 0xdf || headerBuf[3] !== 0xa3) {
-      return { valid: false, durationSec: 0, reason: 'Exported output did not pass WebM container signature check.' };
-    }
+  }
+
+  if (!tracks.validHeader) {
+    return {
+      valid: false,
+      durationSec: 0,
+      hasAudioTrack: false,
+      reason: `Exported output did not pass ${expectedFormat.toUpperCase()} container signature check.`,
+    };
+  }
+
+  if (requireAudio && !tracks.hasAudioTrack) {
+    return {
+      valid: false,
+      durationSec: 0,
+      hasAudioTrack: false,
+      reason: `Audio verification failed: exported ${expectedFormat.toUpperCase()} container is missing an audio track even though music was enabled.`,
+    };
   }
 
   return new Promise((resolve) => {
@@ -1671,7 +2169,13 @@ export async function verifyVideoBlobContainerAndPlayability(
     videoEl.muted = true;
     const timeoutId = window.setTimeout(() => {
       cleanup();
-      resolve({ valid: true, durationSec: 0 });
+      resolve({
+        valid: true,
+        durationSec: 0,
+        hasAudioTrack: tracks.hasAudioTrack,
+        audioCodec: tracks.audioCodec,
+        videoCodec: tracks.videoCodec,
+      });
     }, 4000);
 
     const cleanup = () => {
@@ -1685,14 +2189,30 @@ export async function verifyVideoBlobContainerAndPlayability(
       const hasFrame = videoEl.videoWidth > 0 && videoEl.videoHeight > 0;
       cleanup();
       if (!hasFrame) {
-        resolve({ valid: false, durationSec: dur, reason: 'Video stream contains zero pixel dimensions.' });
+        resolve({
+          valid: false,
+          durationSec: dur,
+          hasAudioTrack: tracks.hasAudioTrack,
+          reason: 'Video stream contains zero pixel dimensions.',
+        });
       } else {
-        resolve({ valid: true, durationSec: dur });
+        resolve({
+          valid: true,
+          durationSec: dur,
+          hasAudioTrack: tracks.hasAudioTrack,
+          audioCodec: tracks.audioCodec,
+          videoCodec: tracks.videoCodec,
+        });
       }
     };
     videoEl.onerror = () => {
       cleanup();
-      resolve({ valid: false, durationSec: 0, reason: 'Browser could not decode exported video metadata.' });
+      resolve({
+        valid: false,
+        durationSec: 0,
+        hasAudioTrack: tracks.hasAudioTrack,
+        reason: 'Browser could not decode exported video metadata.',
+      });
     };
     videoEl.src = testUrl;
   });
@@ -1726,7 +2246,7 @@ async function exportMp4WithWebCodecs(
   const target = new ArrayBufferTarget();
   const hasAudio = Boolean(audioBuffer && audioBuffer.length > 0);
   const audioChannels = audioBuffer ? Math.min(2, audioBuffer.numberOfChannels) : 2;
-  const audioSampleRate = audioBuffer ? audioBuffer.sampleRate : 48000;
+  const audioSampleRate = audioBuffer ? audioBuffer.sampleRate : DEFAULT_AUDIO_SAMPLE_RATE;
 
   const muxer = new Muxer({
     target,
@@ -1788,7 +2308,7 @@ async function exportMp4WithWebCodecs(
         bitrate: 160_000,
       });
 
-      const chunkSize = 2048;
+      const chunkSize = 1024;
       const totalSamples = audioBuffer.length;
       for (let offset = 0; offset < totalSamples; offset += chunkSize) {
         if (signal?.aborted) throw new DOMException('Video export cancelled by user.', 'AbortError');
@@ -1847,7 +2367,6 @@ async function exportMp4WithWebCodecs(
         );
       }
 
-      // Backpressure & main-thread yield to keep UI responsive & memory bounded
       if (videoEncoder.encodeQueueSize > 6 || i % 6 === 0) {
         await new Promise((r) => window.setTimeout(r, videoEncoder.encodeQueueSize > 6 ? 12 : 0));
       }
@@ -1907,6 +2426,24 @@ export async function exportGreetingVideo(
 
   const timeline = buildVideoTimeline(greeting, config);
   const { width, height } = getExportDimensions(config.aspectRatio, config.resolution);
+  const expectsAudio =
+    Boolean(greeting.musicConfig?.enabled) && greeting.musicConfig?.sourceType !== 'none';
+
+  const caps = await detectBrowserVideoCapabilities(
+    width,
+    height,
+    config.fps,
+    expectsAudio,
+    config.aspectRatio,
+    config.quality
+  );
+
+  if (!caps.resolutionSupport[config.resolution]?.supported) {
+    throw new Error(
+      caps.resolutionSupport[config.resolution]?.reason ||
+        `Selected resolution (${config.resolution}) is not supported by this browser/device.`
+    );
+  }
 
   report('preparing', 5, 'Loading & sizing photographs...');
   const imageCache = await loadVideoImageCache(greeting, Math.max(width, height));
@@ -1923,8 +2460,17 @@ export async function exportGreetingVideo(
     const audioRes = await renderMusicToAudioBuffer(
       greeting.musicConfig,
       config.audioOptions,
-      timeline.totalDurationSec
+      timeline.totalDurationSec,
+      caps.preferredAudioSampleRate
     );
+
+    if (expectsAudio && (audioRes.status === 'failed' || !audioRes.buffer)) {
+      throw new Error(
+        audioRes.errorDetail ||
+          audioRes.warning ||
+          'Background music could not be prepared for video export. Switch to a Studio Music Library track or disable music before exporting.'
+      );
+    }
     if (audioRes.warning) warnings.push(audioRes.warning);
 
     if (signal?.aborted) throw new DOMException('Export cancelled.', 'AbortError');
@@ -1938,13 +2484,11 @@ export async function exportGreetingVideo(
     // Render frame 0 before encoding starts
     renderVideoFrame(ctx, width, height, greeting, config, timeline, imageCache, 0, false);
 
-    const caps = await detectBrowserVideoCapabilities(width, height, config.fps, Boolean(audioRes.buffer));
-
     let finalBlob: Blob | null = null;
     let finalFormat: VideoExportFormat = 'webm';
     let finalMime = 'video/webm';
 
-    // Tier 1 for MP4: Billing-free client-side WebCodecs + mp4-muxer (H.264 + AAC)
+    // Tier 1 for MP4: Client-side WebCodecs + mp4-muxer (H.264 + AAC)
     if (config.format === 'mp4' && caps.webCodecsMp4 && caps.preferredWebCodecsVideoCodec) {
       try {
         finalBlob = await exportMp4WithWebCodecs(
@@ -1979,28 +2523,51 @@ export async function exportGreetingVideo(
       }
 
       const preferNativeMp4 = config.format === 'mp4' && caps.mediaRecorderMp4;
-      const { mimeType, nativeMp4 } = getSupportedBrowserMimeType(preferNativeMp4 ? 'mp4' : 'webm');
+      const { mimeType, nativeMp4, supportsAudio } = getSupportedBrowserMimeType(
+        preferNativeMp4 ? 'mp4' : 'webm',
+        Boolean(audioRes.buffer)
+      );
       if (!mimeType) {
         throw new Error('No supported MediaRecorder video codec was found in this browser.');
       }
+      if (audioRes.buffer && !supportsAudio) {
+        throw new Error(
+          'This browser does not support muxing synchronized audio with video export. Please try Chrome, Edge, or Firefox.'
+        );
+      }
 
+      const useManualFramePush = typeof (canvas as HTMLCanvasElement & { captureStream?: (fps?: number) => MediaStream }).captureStream === 'function';
+      if (!useManualFramePush) {
+        throw new Error('Canvas stream capture is unsupported in this browser.');
+      }
       const videoStream = canvas.captureStream(config.fps);
-      const combinedTracks: MediaStreamTrack[] = [...videoStream.getVideoTracks()];
-      activeMediaTracks = combinedTracks;
+      const videoTracks = videoStream.getVideoTracks();
+      const combinedTracks: MediaStreamTrack[] = [...videoTracks];
+      activeMediaTracks = [...combinedTracks];
 
+      let audioStartCtxTime = 0;
       if (audioRes.buffer) {
         const Ctx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        audioCtx = new Ctx();
+        audioCtx = new Ctx({ sampleRate: audioRes.buffer.sampleRate });
         if (audioCtx.state === 'suspended') {
-          await audioCtx.resume().catch(() => {});
+          await audioCtx.resume();
         }
         const dest = audioCtx.createMediaStreamDestination();
         audioSource = audioCtx.createBufferSource();
         audioSource.buffer = audioRes.buffer;
-        audioSource.connect(dest);
-        combinedTracks.push(...dest.stream.getAudioTracks());
+        const exportGain = audioCtx.createGain();
+        exportGain.gain.value = 1;
+        audioSource.connect(exportGain);
+        exportGain.connect(dest);
+        // Never connect exportGain to audioCtx.destination to avoid duplicate speaker playback
+        const audioTracks = dest.stream.getAudioTracks();
+        if (audioTracks.length === 0) {
+          throw new Error('Could not create MediaStream audio track for video export.');
+        }
+        combinedTracks.push(...audioTracks);
+        activeMediaTracks.push(...audioTracks);
       }
 
       const combinedStream = new MediaStream(combinedTracks);
@@ -2008,7 +2575,7 @@ export async function exportGreetingVideo(
       const recorder = new MediaRecorder(combinedStream, {
         mimeType,
         videoBitsPerSecond: bitrate,
-        audioBitsPerSecond: 160_000,
+        ...(audioRes.buffer ? { audioBitsPerSecond: 160_000 } : {}),
       });
 
       const chunks: BlobPart[] = [];
@@ -2046,7 +2613,7 @@ export async function exportGreetingVideo(
           if (stopped) return;
           stopped = true;
           cleanupTimers();
-          reject(new Error('MediaRecorder failed while encoding video frames.'));
+          reject(new Error('MediaRecorder failed while encoding video+audio stream.'));
         };
 
         recorder.onstop = () => {
@@ -2056,30 +2623,46 @@ export async function exportGreetingVideo(
           resolve(new Blob(chunks, { type: mimeType }));
         };
 
-        const renderStartMs = performance.now();
         const totalMs = timeline.totalDurationSec * 1000;
         const frameStepMs = 1000 / config.fps;
 
+        // Start audio first at slight lookahead so frame 0 aligns cleanly with WebAudio render quantum
+        const renderStartPerfMs = performance.now();
+        if (audioCtx && audioSource) {
+          audioStartCtxTime = audioCtx.currentTime + 0.05;
+          audioSource.start(audioStartCtxTime);
+        }
         recorder.start(250);
-        audioSource?.start(0);
 
         frameTimer = window.setInterval(() => {
           if (stopped) return;
-          const elapsed = performance.now() - renderStartMs;
-          const timeSec = Math.min(timeline.totalDurationSec, elapsed / 1000);
+          // Drive video clock from AudioContext when audio is active so audio & video never drift
+          const elapsedSec =
+            audioCtx && audioRes.buffer
+              ? Math.max(0, audioCtx.currentTime - audioStartCtxTime)
+              : (performance.now() - renderStartPerfMs) / 1000;
+          const timeSec = Math.min(timeline.totalDurationSec, elapsedSec);
           renderVideoFrame(ctx, width, height, greeting, config, timeline, imageCache, timeSec, false);
 
-          const frac = Math.min(1, elapsed / totalMs);
+          // Request frame on CanvasCaptureMediaStreamTrack if browser supports manual flush
+          for (const vt of videoTracks) {
+            const capTrack = vt as MediaStreamTrack & { requestFrame?: () => void };
+            if (typeof capTrack.requestFrame === 'function') {
+              capTrack.requestFrame();
+            }
+          }
+
+          const frac = Math.min(1, (timeSec * 1000) / totalMs);
           const pct = 15 + frac * (config.format === 'mp4' && !nativeMp4 && ffmpegAvailable ? 62 : 78);
-          const remainingMs = Math.max(0, totalMs - elapsed);
+          const remainingMs = Math.max(0, totalMs - timeSec * 1000);
           report(
             'rendering',
             pct,
-            `Recording browser stream (${timeSec.toFixed(1)}s / ${timeline.totalDurationSec.toFixed(1)}s)...`,
+            `Recording synchronized video${audioRes.buffer ? ' + audio' : ''} (${timeSec.toFixed(1)}s / ${timeline.totalDurationSec.toFixed(1)}s)...`,
             remainingMs
           );
 
-          if (elapsed >= totalMs + 80) {
+          if (elapsedSec >= timeline.totalDurationSec + 0.12) {
             if (frameTimer !== null) {
               window.clearInterval(frameTimer);
               frameTimer = null;
@@ -2090,6 +2673,11 @@ export async function exportGreetingVideo(
               // Ignore
             }
             if (recorder.state !== 'inactive') {
+              try {
+                recorder.requestData();
+              } catch {
+                // Ignore
+              }
               recorder.stop();
             }
           }
@@ -2109,8 +2697,12 @@ export async function exportGreetingVideo(
       }
     }
 
-    report('verifying', 95, 'Verifying playable container & duration...');
-    const verified = await verifyVideoBlobContainerAndPlayability(finalBlob, finalFormat);
+    report('verifying', 95, 'Verifying playable container & audio stream...');
+    const verified = await verifyVideoBlobContainerAndPlayability(
+      finalBlob,
+      finalFormat,
+      expectsAudio
+    );
     if (!verified.valid) {
       throw new Error(verified.reason || 'Export verification failed.');
     }
@@ -2129,6 +2721,9 @@ export async function exportGreetingVideo(
       width,
       height,
       sizeBytes: finalBlob.size,
+      hasAudioTrack: verified.hasAudioTrack,
+      audioCodec: verified.audioCodec,
+      videoCodec: verified.videoCodec,
       warnings,
     };
   } finally {

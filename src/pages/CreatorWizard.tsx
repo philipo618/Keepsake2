@@ -36,12 +36,18 @@ import {
   STICKER_PALETTE,
 } from '../lib/catalog';
 import { audioEngine, LICENSED_MUSIC_LIBRARY } from '../lib/audioEngine';
+import { isAutoFilenameLike, sanitizePresentationCaption } from '../lib/captionUtils';
 import {
   generateShortId,
   uploadCardDocumentToCloudinary,
   type UploadProgressInfo,
 } from '../lib/cloudinaryService';
-import { encryptModeBCardDocument } from '../lib/cryptoVault';
+import {
+  encryptModeBCardDocumentV3,
+  MODE_B_SECURITY_NOTICE,
+  ModeBDecryptError,
+  normalizeBirthdaySecretInputs,
+} from '../lib/cryptoVault';
 import { uploadMediaFile } from '../lib/imageUtils';
 import {
   getDraftFromIndexedDb,
@@ -110,12 +116,13 @@ function createInitialGreeting(creatorId: string, categoryId = 'birthday', templ
     animations: template ? ['gift-box', template.animationStyle, 'sparkles'] : ['gift-box', 'confetti', 'sparkles'],
     accessMode: 'direct',
     verificationMeta: {
-      enableBirthdayDay: true,
+      enableAge: true,
+      enableBirthdayDay: false,
       enableBirthdayMonth: true,
       enableBirthdayYear: true,
       customQuestions: [],
       maxRetries: 5,
-      friendlyErrorMessage: 'Not quite! Take another moment and try again.',
+      friendlyErrorMessage: 'Those birthday details didn’t quite match. Take another moment and try again.',
     },
     status: 'draft',
   };
@@ -143,9 +150,10 @@ export function CreatorWizard({
   });
 
   const [secrets, setSecrets] = useState<VerificationSecretsInput>({
+    age: 29,
     birthDay: 15,
     birthMonth: 6,
-    birthYear: 1995,
+    birthYear: 1996,
     customAnswers: [],
   });
 
@@ -170,6 +178,7 @@ export function CreatorWizard({
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [fullPreviewOpen, setFullPreviewOpen] = useState(false);
   const [videoStudioOpen, setVideoStudioOpen] = useState(Boolean(initialOpenVideoStudio));
+  const [previewBirthdayPassed, setPreviewBirthdayPassed] = useState(false);
   const [previewGateUnlocked, setPreviewGateUnlocked] = useState(false);
   const [previewResetSeed, setPreviewResetSeed] = useState(0);
   const [publishedShare, setPublishedShare] = useState<{
@@ -183,6 +192,7 @@ export function CreatorWizard({
   const hasUserEditedRef = useRef(Boolean(editId));
 
   const openFullPreview = () => {
+    setPreviewBirthdayPassed(false);
     setPreviewGateUnlocked(false);
     setPreviewResetSeed((n) => n + 1);
     setFullPreviewOpen(true);
@@ -347,6 +357,10 @@ export function CreatorWizard({
         signal: controller.signal,
         onProgress: (prog) => setAudioUploadProgress(prog),
       });
+      const rawBase = file.name.replace(/\.[^.]+$/, '').slice(0, 80);
+      const safeTrackTitle = isAutoFilenameLike(file.name)
+        ? 'Personal Soundtrack'
+        : sanitizePresentationCaption(rawBase) || 'Personal Soundtrack';
       commitChange((prev) => ({
         ...prev,
         musicConfig: {
@@ -359,13 +373,13 @@ export function CreatorWizard({
           bytes: res.sizeBytes,
           durationSec: res.durationSec,
           localBlobId: res.localBlobId,
-          trackTitle: file.name.replace(/\.[^.]+$/, '').slice(0, 80),
+          trackTitle: safeTrackTitle,
           trackId: 'uploaded-audio',
         },
       }));
       setStatusMessage({
         type: 'success',
-        text: `Uploaded "${file.name}" (${res.durationSec ? `${res.durationSec}s · ` : ''}${(res.sizeBytes / (1024 * 1024)).toFixed(2)} MB) to Cloudinary.`,
+        text: `Uploaded custom soundtrack (${res.durationSec ? `${res.durationSec}s · ` : ''}${(res.sizeBytes / (1024 * 1024)).toFixed(2)} MB) to Cloudinary.`,
       });
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') {
@@ -389,14 +403,15 @@ export function CreatorWizard({
     if (!greeting.title.trim()) return 'Please provide a card headline in Step 3.';
     if (isPublishing && greeting.accessMode === 'interactive') {
       const v = greeting.verificationMeta;
-      if (v.enableBirthdayDay && (!secrets.birthDay || secrets.birthDay < 1 || secrets.birthDay > 31)) {
-        return 'Enter a valid birthday day (1–31) or uncheck Birth Day.';
+      const maxYear = new Date().getFullYear();
+      if (!secrets.age || secrets.age < 1 || secrets.age > 125) {
+        return 'Enter the recipient’s valid age (1–125) in Step 8.';
       }
-      if (v.enableBirthdayMonth && (!secrets.birthMonth || secrets.birthMonth < 1 || secrets.birthMonth > 12)) {
-        return 'Select a valid birth month or uncheck Birth Month.';
+      if (!secrets.birthMonth || secrets.birthMonth < 1 || secrets.birthMonth > 12) {
+        return 'Select the recipient’s birth month in Step 8.';
       }
-      if (v.enableBirthdayYear && (!secrets.birthYear || secrets.birthYear < 1900 || secrets.birthYear > 2100)) {
-        return 'Enter a valid 4-digit birth year or uncheck Birth Year.';
+      if (!secrets.birthYear || secrets.birthYear < 1900 || secrets.birthYear > maxYear) {
+        return `Enter a valid 4-digit birth year (1900–${maxYear}) in Step 8.`;
       }
       for (const q of v.customQuestions.filter((c) => c.enabled)) {
         const ans = secrets.customAnswers.find((a) => a.id === q.id)?.answer?.trim();
@@ -457,7 +472,7 @@ export function CreatorWizard({
       const isEncrypted = publishPayload.accessMode === 'interactive';
 
       if (isEncrypted) {
-        const { envelope, keyBase64Url } = await encryptModeBCardDocument(
+        const envelope = await encryptModeBCardDocumentV3(
           publishCardId,
           publishPayload,
           secrets
@@ -467,7 +482,7 @@ export function CreatorWizard({
         publicId = uploaded.publicId;
         secureUrl = uploaded.secureUrl;
         bytes = uploaded.bytes;
-        encryptionKey = keyBase64Url;
+        encryptionKey = null;
       } else {
         const publicDoc: CardDocumentV2Public = {
           schemaVersion: 2,
@@ -518,7 +533,7 @@ export function CreatorWizard({
       setStatusMessage({
         type: 'success',
         text: isEncrypted
-          ? 'Encrypted Mode B card published to Cloudinary! Share the full link (including #key=...) with your recipient.'
+          ? 'Encrypted Mode B card published to Cloudinary! Your recipient unlocks it using their Age, Birth Month, and Birth Year.'
           : 'Your greeting card is published live on Cloudinary CDN!',
       });
     } catch (err) {
@@ -1156,7 +1171,7 @@ export function CreatorWizard({
                       </p>
                       <p className="text-xs text-slate-500">
                         {greeting.musicConfig.sourceType === 'uploaded' && greeting.musicConfig.trackTitle
-                          ? `Selected: ${greeting.musicConfig.trackTitle}${
+                          ? `Selected: ${sanitizePresentationCaption(greeting.musicConfig.trackTitle) || 'Custom Soundtrack'}${
                               greeting.musicConfig.durationSec
                                 ? ` · ${greeting.musicConfig.durationSec}s`
                                 : ''
@@ -1796,9 +1811,20 @@ export function CreatorWizard({
                 <button
                   type="button"
                   onClick={() => {
+                    setPreviewBirthdayPassed(false);
                     setPreviewGateUnlocked(false);
                     setPreviewResetSeed((n) => n + 1);
-                    commitChange((p) => ({ ...p, accessMode: 'interactive' }));
+                    commitChange((p) => ({
+                      ...p,
+                      accessMode: 'interactive',
+                      verificationMeta: {
+                        ...p.verificationMeta,
+                        enableAge: true,
+                        enableBirthdayDay: false,
+                        enableBirthdayMonth: true,
+                        enableBirthdayYear: true,
+                      },
+                    }));
                   }}
                   className={`text-left rounded-xl border p-4 transition-colors ${
                     greeting.accessMode === 'interactive'
@@ -1808,78 +1834,54 @@ export function CreatorWizard({
                 >
                   <p className="font-medium text-sm text-slate-900 dark:text-white flex items-center gap-1.5">
                     <Lock className="w-3.5 h-3.5 text-rose-700 dark:text-rose-400" />
-                    <span>Mode B: Encrypted Private Card</span>
+                    <span>Mode B: Birthday-Protected Private Card</span>
                   </p>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    Seals your card in the browser using a random AES-256-GCM key embedded strictly in the URL fragment (#key=...), plus optional birthday/memory quiz prompts inside the encrypted bundle.
+                    Seals your card with PBKDF2-SHA256 + AES-256-GCM keyed by the recipient&apos;s Age, Birth Month, and Birth Year. Nothing sensitive is uploaded in plaintext.
                   </p>
                 </button>
               </div>
 
               {greeting.accessMode === 'interactive' && (
                 <div className="space-y-5 rounded-xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 bg-slate-50/60 dark:bg-slate-900/40">
-                  <div className="rounded-lg border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/30 p-3 text-xs text-emerald-800 dark:text-emerald-200">
-                    <strong>Zero-Knowledge Client Encryption:</strong> Your browser encrypts the greeting JSON with Web Crypto (<code className="font-mono">AES-256-GCM</code>) before uploading to Cloudinary. The decryption key lives exclusively in the share URL fragment (<code className="font-mono">#key=...</code>) and is never uploaded or stored on Cloudinary. Optional birthday prompts below are also sealed inside the encrypted bundle.
+                  <div className="rounded-lg border border-amber-200 dark:border-amber-900/60 bg-amber-50/70 dark:bg-amber-950/30 p-3 text-xs text-amber-900 dark:text-amber-200">
+                    <strong>How Mode B Encryption Works:</strong> {MODE_B_SECURITY_NOTICE}
                   </div>
                   <div className="space-y-3">
                     <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                      Optional Birthday Verification Sequence
+                      Required Birthday Verification (Age + Birth Month + Birth Year)
                     </p>
 
-                    {/* Day */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-200/70 dark:border-slate-800">
-                      <label className="flex items-center gap-2.5 text-sm font-medium cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={greeting.verificationMeta.enableBirthdayDay}
-                          onChange={(e) =>
-                            commitChange((p) => ({
-                              ...p,
-                              verificationMeta: { ...p.verificationMeta, enableBirthdayDay: e.target.checked },
-                            }))
-                          }
-                          className="accent-rose-700 w-4 h-4"
-                        />
-                        <span>Screen 1: Birth Day (1–31)</span>
-                      </label>
-                      {greeting.verificationMeta.enableBirthdayDay && (
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      {/* Recipient Age */}
+                      <label className="block space-y-1.5">
+                        <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                          Recipient&apos;s Age *
+                        </span>
                         <input
                           type="number"
                           min={1}
-                          max={31}
-                          value={secrets.birthDay ?? ''}
+                          max={125}
+                          value={secrets.age ?? ''}
                           onChange={(e) =>
-                            setSecrets((s) => ({ ...s, birthDay: Number(e.target.value) || null }))
+                            setSecrets((s) => ({ ...s, age: Number(e.target.value) || null }))
                           }
-                          placeholder="Day (1–31)"
-                          className="w-32 min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-mono tabular-nums"
+                          placeholder="e.g., 29"
+                          className="w-full min-h-[42px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-mono tabular-nums"
                         />
-                      )}
-                    </div>
-
-                    {/* Month */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-200/70 dark:border-slate-800">
-                      <label className="flex items-center gap-2.5 text-sm font-medium cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={greeting.verificationMeta.enableBirthdayMonth}
-                          onChange={(e) =>
-                            commitChange((p) => ({
-                              ...p,
-                              verificationMeta: { ...p.verificationMeta, enableBirthdayMonth: e.target.checked },
-                            }))
-                          }
-                          className="accent-rose-700 w-4 h-4"
-                        />
-                        <span>Screen 2: Birth Month (Jan–Dec)</span>
                       </label>
-                      {greeting.verificationMeta.enableBirthdayMonth && (
+
+                      {/* Birth Month */}
+                      <label className="block space-y-1.5">
+                        <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                          Birth Month *
+                        </span>
                         <select
                           value={secrets.birthMonth ?? 6}
                           onChange={(e) =>
                             setSecrets((s) => ({ ...s, birthMonth: Number(e.target.value) }))
                           }
-                          className="w-44 min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                          className="w-full min-h-[42px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                         >
                           {MONTHS.map((m, i) => (
                             <option key={m} value={i + 1}>
@@ -1887,38 +1889,25 @@ export function CreatorWizard({
                             </option>
                           ))}
                         </select>
-                      )}
-                    </div>
-
-                    {/* Year */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                      <label className="flex items-center gap-2.5 text-sm font-medium cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={greeting.verificationMeta.enableBirthdayYear}
-                          onChange={(e) =>
-                            commitChange((p) => ({
-                              ...p,
-                              verificationMeta: { ...p.verificationMeta, enableBirthdayYear: e.target.checked },
-                            }))
-                          }
-                          className="accent-rose-700 w-4 h-4"
-                        />
-                        <span>Screen 3: Birth Year</span>
                       </label>
-                      {greeting.verificationMeta.enableBirthdayYear && (
+
+                      {/* Birth Year */}
+                      <label className="block space-y-1.5">
+                        <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                          Birth Year *
+                        </span>
                         <input
                           type="number"
                           min={1900}
-                          max={2026}
+                          max={new Date().getFullYear()}
                           value={secrets.birthYear ?? ''}
                           onChange={(e) =>
                             setSecrets((s) => ({ ...s, birthYear: Number(e.target.value) || null }))
                           }
-                          placeholder="e.g., 1995"
-                          className="w-32 min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-mono tabular-nums"
+                          placeholder="e.g., 1996"
+                          className="w-full min-h-[42px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm font-mono tabular-nums"
                         />
-                      )}
+                      </label>
                     </div>
                   </div>
 
@@ -2077,7 +2066,7 @@ export function CreatorWizard({
                 <div className="rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50/50 dark:bg-emerald-950/20 p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs">
                   <div>
                     <p className="font-semibold text-emerald-800 dark:text-emerald-200">
-                      Attached Video Keepsake: {greeting.exportedVideo.fileName}
+                      Attached Video Keepsake · Ready for Recipients
                     </p>
                     <p className="text-[11px] text-emerald-700/80 dark:text-emerald-300/80">
                       {greeting.exportedVideo.width}×{greeting.exportedVideo.height} ·{' '}
@@ -2174,6 +2163,7 @@ export function CreatorWizard({
                 <button
                   type="button"
                   onClick={() => {
+                    setPreviewBirthdayPassed(false);
                     setPreviewGateUnlocked(false);
                     setPreviewResetSeed((n) => n + 1);
                   }}
@@ -2186,17 +2176,67 @@ export function CreatorWizard({
           </div>
 
           {step === 7 && greeting.accessMode === 'interactive' && !previewGateUnlocked ? (
-            <VerificationGate
-              key={`inline-gate-${previewResetSeed}`}
-              greeting={{
-                ...greeting,
-                recipientName: greeting.recipientName || 'Recipient',
-                senderName: greeting.senderName || 'You',
-              }}
-              previewMode
-              previewSecrets={secrets}
-              onVerified={() => setPreviewGateUnlocked(true)}
-            />
+            !previewBirthdayPassed ? (
+              <VerificationGate
+                key={`inline-v3-${previewResetSeed}`}
+                v3Mode
+                previewMode
+                v3CardId={greeting.id}
+                v3Teaser={{
+                  recipientHint: greeting.recipientName || 'Recipient',
+                  senderHint: greeting.senderName || 'You',
+                }}
+                v3Policy={{
+                  maxRetries: greeting.verificationMeta.maxRetries,
+                  friendlyErrorMessage: greeting.verificationMeta.friendlyErrorMessage,
+                }}
+                accentColor={greeting.designConfig.accentColor}
+                onUnlockWithBirthday={async (submitted) => {
+                  const expected = normalizeBirthdaySecretInputs({
+                    age: secrets.age,
+                    birthMonth: secrets.birthMonth,
+                    birthYear: secrets.birthYear,
+                  });
+                  if (
+                    submitted.age !== expected.age ||
+                    submitted.birthMonth !== expected.birthMonth ||
+                    submitted.birthYear !== expected.birthYear
+                  ) {
+                    throw new ModeBDecryptError(
+                      'WRONG_ANSWERS',
+                      greeting.verificationMeta.friendlyErrorMessage ||
+                        'Those birthday details didn’t quite match.'
+                    );
+                  }
+                }}
+                onVerified={() => {
+                  if (greeting.verificationMeta.customQuestions.some((q) => q.enabled)) {
+                    setPreviewBirthdayPassed(true);
+                  } else {
+                    setPreviewGateUnlocked(true);
+                  }
+                }}
+              />
+            ) : (
+              <VerificationGate
+                key={`inline-custom-${previewResetSeed}`}
+                greeting={{
+                  ...greeting,
+                  verificationMeta: {
+                    ...greeting.verificationMeta,
+                    enableAge: false,
+                    enableBirthdayDay: false,
+                    enableBirthdayMonth: false,
+                    enableBirthdayYear: false,
+                  },
+                  recipientName: greeting.recipientName || 'Recipient',
+                  senderName: greeting.senderName || 'You',
+                }}
+                previewMode
+                previewSecrets={secrets}
+                onVerified={() => setPreviewGateUnlocked(true)}
+              />
+            )
           ) : (
             <GreetingExperience
               greeting={{
@@ -2255,10 +2295,11 @@ export function CreatorWizard({
                   : 'Preview · Mode A: Direct Access'}
               </span>
               <div className="flex items-center gap-2">
-                {greeting.accessMode === 'interactive' && previewGateUnlocked && (
+                {greeting.accessMode === 'interactive' && (previewBirthdayPassed || previewGateUnlocked) && (
                   <button
                     type="button"
                     onClick={() => {
+                      setPreviewBirthdayPassed(false);
                       setPreviewGateUnlocked(false);
                       setPreviewResetSeed((n) => n + 1);
                     }}
@@ -2279,17 +2320,67 @@ export function CreatorWizard({
 
             {greeting.accessMode === 'interactive' && !previewGateUnlocked ? (
               <div className="py-6">
-                <VerificationGate
-                  key={`modal-gate-${previewResetSeed}`}
-                  greeting={{
-                    ...greeting,
-                    recipientName: greeting.recipientName || 'Recipient',
-                    senderName: greeting.senderName || 'You',
-                  }}
-                  previewMode
-                  previewSecrets={secrets}
-                  onVerified={() => setPreviewGateUnlocked(true)}
-                />
+                {!previewBirthdayPassed ? (
+                  <VerificationGate
+                    key={`modal-v3-${previewResetSeed}`}
+                    v3Mode
+                    previewMode
+                    v3CardId={greeting.id}
+                    v3Teaser={{
+                      recipientHint: greeting.recipientName || 'Recipient',
+                      senderHint: greeting.senderName || 'You',
+                    }}
+                    v3Policy={{
+                      maxRetries: greeting.verificationMeta.maxRetries,
+                      friendlyErrorMessage: greeting.verificationMeta.friendlyErrorMessage,
+                    }}
+                    accentColor={greeting.designConfig.accentColor}
+                    onUnlockWithBirthday={async (submitted) => {
+                      const expected = normalizeBirthdaySecretInputs({
+                        age: secrets.age,
+                        birthMonth: secrets.birthMonth,
+                        birthYear: secrets.birthYear,
+                      });
+                      if (
+                        submitted.age !== expected.age ||
+                        submitted.birthMonth !== expected.birthMonth ||
+                        submitted.birthYear !== expected.birthYear
+                      ) {
+                        throw new ModeBDecryptError(
+                          'WRONG_ANSWERS',
+                          greeting.verificationMeta.friendlyErrorMessage ||
+                            'Those birthday details didn’t quite match.'
+                        );
+                      }
+                    }}
+                    onVerified={() => {
+                      if (greeting.verificationMeta.customQuestions.some((q) => q.enabled)) {
+                        setPreviewBirthdayPassed(true);
+                      } else {
+                        setPreviewGateUnlocked(true);
+                      }
+                    }}
+                  />
+                ) : (
+                  <VerificationGate
+                    key={`modal-custom-${previewResetSeed}`}
+                    greeting={{
+                      ...greeting,
+                      verificationMeta: {
+                        ...greeting.verificationMeta,
+                        enableAge: false,
+                        enableBirthdayDay: false,
+                        enableBirthdayMonth: false,
+                        enableBirthdayYear: false,
+                      },
+                      recipientName: greeting.recipientName || 'Recipient',
+                      senderName: greeting.senderName || 'You',
+                    }}
+                    previewMode
+                    previewSecrets={secrets}
+                    onVerified={() => setPreviewGateUnlocked(true)}
+                  />
+                )}
               </div>
             ) : (
               <GreetingExperience

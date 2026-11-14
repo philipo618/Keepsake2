@@ -3,9 +3,9 @@ import {
   loadCloudinaryRuntimeOverride,
 } from './indexedDbService';
 import type {
+  AnyModeBEnvelope,
   CardDocumentV2Public,
   Greeting,
-  ModeBEncryptedEnvelope,
   UploadDiagnosticRecord,
 } from './types';
 
@@ -526,7 +526,7 @@ export async function uploadMediaAssetToCloudinary(
  */
 export async function uploadCardDocumentToCloudinary(
   cardId: string,
-  documentPayload: CardDocumentV2Public | ModeBEncryptedEnvelope,
+  documentPayload: CardDocumentV2Public | AnyModeBEnvelope,
   options?: {
     signal?: AbortSignal;
     onProgress?: (progress: UploadProgressInfo) => void;
@@ -572,7 +572,7 @@ export async function uploadCardDocumentToCloudinary(
  */
 export async function fetchCardDocumentFromCloudinary(
   routeCardId: string
-): Promise<CardDocumentV2Public | ModeBEncryptedEnvelope | Greeting> {
+): Promise<CardDocumentV2Public | AnyModeBEnvelope | Greeting> {
   const cfg = await resolveCloudinaryConfig();
   if (!cfg.cloudName) {
     throw new Error(
@@ -595,7 +595,7 @@ export async function fetchCardDocumentFromCloudinary(
   }
 
   try {
-    return (await resp.json()) as CardDocumentV2Public | ModeBEncryptedEnvelope | Greeting;
+    return (await resp.json()) as CardDocumentV2Public | AnyModeBEnvelope | Greeting;
   } catch {
     throw new Error('The card JSON document fetched from Cloudinary is corrupted or unreadable.');
   }

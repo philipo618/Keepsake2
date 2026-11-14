@@ -17,7 +17,8 @@ import {
   UploadCloud,
   X,
 } from 'lucide-react';
-import { LICENSED_MUSIC_LIBRARY } from '../lib/audioEngine';
+import { audioEngine, LICENSED_MUSIC_LIBRARY } from '../lib/audioEngine';
+import { sanitizePresentationCaption } from '../lib/captionUtils';
 import {
   createDefaultVideoStudioConfig,
   PHOTO_PRESENTATIONS,
@@ -36,6 +37,7 @@ import {
   detectBrowserVideoCapabilities,
   exportGreetingVideo,
   getExportDimensions,
+  getTimelinePacingWarning,
   loadVideoImageCache,
   renderVideoFrame,
   type BrowserVideoCapabilities,
@@ -123,8 +125,25 @@ export function VideoExportStudio({
     webmMimeType: 'video/webm',
     mp4MimeType: '',
     preferredWebCodecsVideoCodec: null,
+    preferredAudioSampleRate: 48000,
+    resolutionSupport: {
+      '480p': { supported: true },
+      '720p': { supported: true },
+      '1080p': { supported: true },
+    },
   });
   const [capsChecked, setCapsChecked] = useState(false);
+
+  // Duration preset & custom unit UI state
+  const DURATION_PRESETS = [10, 15, 30, 45, 60] as const;
+  const [customDurationOpen, setCustomDurationOpen] = useState<boolean>(() => {
+    const cur = config.customTotalDurationSec;
+    return typeof cur === 'number' && !DURATION_PRESETS.includes(cur as 10 | 15 | 30 | 45 | 60);
+  });
+  const [customDurationUnit, setCustomDurationUnit] = useState<'seconds' | 'minutes'>('seconds');
+  const [customDurationInput, setCustomDurationInput] = useState<string>(() =>
+    config.customTotalDurationSec ? String(config.customTotalDurationSec) : '30'
+  );
 
   // Export & Cloudinary upload state
   const [exporting, setExporting] = useState(false);
@@ -163,11 +182,21 @@ export function VideoExportStudio({
     let active = true;
     const dims = getExportDimensions(config.aspectRatio, config.resolution);
     const needsAudio = greeting.musicConfig.enabled && greeting.musicConfig.sourceType !== 'none';
-    detectBrowserVideoCapabilities(dims.width, dims.height, config.fps, needsAudio)
+    detectBrowserVideoCapabilities(
+      dims.width,
+      dims.height,
+      config.fps,
+      needsAudio,
+      config.aspectRatio,
+      config.quality
+    )
       .then((caps) => {
         if (active) {
           setBrowserCaps(caps);
           setCapsChecked(true);
+          if (config.resolution === '1080p' && !caps.resolutionSupport['1080p'].supported) {
+            updateConfig((c) => ({ ...c, resolution: '720p' }));
+          }
         }
       })
       .catch(() => {
@@ -176,7 +205,15 @@ export function VideoExportStudio({
     return () => {
       active = false;
     };
-  }, [config.aspectRatio, config.resolution, config.fps, greeting.musicConfig.enabled, greeting.musicConfig.sourceType]);
+  }, [
+    config.aspectRatio,
+    config.resolution,
+    config.fps,
+    config.quality,
+    greeting.musicConfig.enabled,
+    greeting.musicConfig.sourceType,
+    updateConfig,
+  ]);
 
   // Keep image cache warm whenever photos or background change
   const photoSig = useMemo(
@@ -341,8 +378,15 @@ export function VideoExportStudio({
     }));
   };
 
+  const pacingWarning = useMemo(
+    () => getTimelinePacingWarning(timeline, config.resolution),
+    [timeline, config.resolution]
+  );
+
   const handleStartExport = async () => {
     setIsPlaying(false);
+    audioEngine.stop();
+    audioSyncRef.current?.stop();
     setExportError(null);
     setAttachSuccess(null);
     if (exportedUrlRef.current) {
@@ -415,6 +459,8 @@ export function VideoExportStudio({
         width: exportedResult.width,
         height: exportedResult.height,
         sizeBytes: uploaded.bytes || exportedResult.sizeBytes,
+        hasAudioTrack: exportedResult.hasAudioTrack,
+        audioCodec: exportedResult.audioCodec,
         attachedAt: new Date().toISOString(),
       };
       onUpdateGreeting((prev) => ({
@@ -455,6 +501,8 @@ export function VideoExportStudio({
       width: exportedResult.width,
       height: exportedResult.height,
       sizeBytes: exportedResult.sizeBytes,
+      hasAudioTrack: exportedResult.hasAudioTrack,
+      audioCodec: exportedResult.audioCodec,
       attachedAt: new Date().toISOString(),
     };
     onUpdateGreeting((prev) => ({
@@ -1068,7 +1116,9 @@ export function VideoExportStudio({
                             referrerPolicy="no-referrer"
                             className="w-10 h-8 rounded object-cover shrink-0"
                           />
-                          <span className="truncate flex-1">{photo.caption || `Photo ${idx + 1}`}</span>
+                          <span className="truncate flex-1">
+                            {sanitizePresentationCaption(photo.caption) || `Memory ${idx + 1}`}
+                          </span>
                           <select
                             value={resolvePhotoTransition(photo.transition)}
                             onChange={(e) =>
@@ -1287,7 +1337,8 @@ export function VideoExportStudio({
                       >
                         {greeting.musicConfig.sourceType === 'uploaded' && (
                           <option value="uploaded">
-                            Uploaded: {greeting.musicConfig.trackTitle || 'Custom Audio'}
+                            Uploaded:{' '}
+                            {sanitizePresentationCaption(greeting.musicConfig.trackTitle) || 'Custom Soundtrack'}
                           </option>
                         )}
                         {LICENSED_MUSIC_LIBRARY.map((t) => (
@@ -1470,9 +1521,16 @@ export function VideoExportStudio({
                         }
                         className="w-full min-h-[40px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
                       >
-                        <option value="480p">480p (Fast)</option>
-                        <option value="720p">720p HD</option>
-                        <option value="1080p">1080p Full HD</option>
+                        <option value="480p">480p (SD Fast)</option>
+                        <option value="720p">720p (HD Recommended)</option>
+                        <option
+                          value="1080p"
+                          disabled={capsChecked && !browserCaps.resolutionSupport['1080p'].supported}
+                        >
+                          {capsChecked && !browserCaps.resolutionSupport['1080p'].supported
+                            ? '1080p Full HD (Unavailable on this device)'
+                            : '1080p (Full HD)'}
+                        </option>
                       </select>
                     </label>
 
@@ -1494,7 +1552,142 @@ export function VideoExportStudio({
                     </label>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {capsChecked && !browserCaps.resolutionSupport['1080p'].supported && (
+                    <div className="rounded-lg border border-amber-200 dark:border-amber-900/60 bg-amber-50/60 dark:bg-amber-950/20 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
+                      {browserCaps.resolutionSupport['1080p'].reason}
+                    </div>
+                  )}
+
+                  {/* Video Duration Presets & Custom Selector */}
+                  <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-slate-600 dark:text-slate-300 font-medium">
+                        Target Video Duration
+                      </span>
+                      <span className="font-mono tabular-nums text-[11px] text-slate-500">
+                        Estimated: {timeline.totalDurationSec.toFixed(1)}s · {timeline.scenes.length} scenes
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCustomDurationOpen(false);
+                          updateConfig((c) => ({ ...c, customTotalDurationSec: null }));
+                        }}
+                        className={`min-h-[36px] px-3 rounded-lg border text-xs font-medium transition-colors ${
+                          !customDurationOpen && config.customTotalDurationSec == null
+                            ? 'border-rose-600 bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300'
+                            : 'border-slate-200 dark:border-slate-700 hover:border-slate-300'
+                        }`}
+                      >
+                        Auto
+                      </button>
+                      {(
+                        [
+                          { sec: 10, label: '10s' },
+                          { sec: 15, label: '15s' },
+                          { sec: 30, label: '30s' },
+                          { sec: 45, label: '45s' },
+                          { sec: 60, label: '1 min' },
+                        ] as const
+                      ).map((preset) => {
+                        const active =
+                          !customDurationOpen && config.customTotalDurationSec === preset.sec;
+                        return (
+                          <button
+                            key={preset.sec}
+                            type="button"
+                            onClick={() => {
+                              setCustomDurationOpen(false);
+                              updateConfig((c) => ({
+                                ...c,
+                                customTotalDurationSec: preset.sec,
+                              }));
+                            }}
+                            className={`min-h-[36px] px-3 rounded-lg border text-xs font-medium font-mono tabular-nums transition-colors ${
+                              active
+                                ? 'border-rose-600 bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300'
+                                : 'border-slate-200 dark:border-slate-700 hover:border-slate-300'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCustomDurationOpen(true);
+                          const baseSec = config.customTotalDurationSec || Math.round(timeline.totalDurationSec);
+                          const clamped = Math.max(5, Math.min(600, baseSec));
+                          setCustomDurationUnit('seconds');
+                          setCustomDurationInput(String(clamped));
+                          updateConfig((c) => ({ ...c, customTotalDurationSec: clamped }));
+                        }}
+                        className={`min-h-[36px] px-3 rounded-lg border text-xs font-medium transition-colors ${
+                          customDurationOpen ||
+                          (config.customTotalDurationSec != null &&
+                            ![10, 15, 30, 45, 60].includes(config.customTotalDurationSec))
+                            ? 'border-rose-600 bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300'
+                            : 'border-slate-200 dark:border-slate-700 hover:border-slate-300'
+                        }`}
+                      >
+                        Custom
+                      </button>
+                    </div>
+
+                    {customDurationOpen && (
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <input
+                          type="number"
+                          min={customDurationUnit === 'minutes' ? 0.1 : 5}
+                          max={customDurationUnit === 'minutes' ? 10 : 600}
+                          step={customDurationUnit === 'minutes' ? 0.5 : 1}
+                          value={customDurationInput}
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setCustomDurationInput(raw);
+                            const num = Number(raw);
+                            if (Number.isFinite(num) && num > 0) {
+                              const sec = customDurationUnit === 'minutes' ? num * 60 : num;
+                              const clamped = Math.max(5, Math.min(600, Math.round(sec)));
+                              updateConfig((c) => ({ ...c, customTotalDurationSec: clamped }));
+                            }
+                          }}
+                          aria-label="Custom video duration value"
+                          className="w-28 min-h-[38px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono"
+                        />
+                        <select
+                          value={customDurationUnit}
+                          onChange={(e) => {
+                            const nextUnit = e.target.value as 'seconds' | 'minutes';
+                            const curSec = config.customTotalDurationSec || 30;
+                            setCustomDurationUnit(nextUnit);
+                            setCustomDurationInput(
+                              nextUnit === 'minutes'
+                                ? String(Math.round((curSec / 60) * 10) / 10)
+                                : String(Math.round(curSec))
+                            );
+                          }}
+                          aria-label="Custom duration unit"
+                          className="min-h-[38px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                        >
+                          <option value="seconds">Seconds (5–600s)</option>
+                          <option value="minutes">Minutes (up to 10m)</option>
+                        </select>
+                      </div>
+                    )}
+
+                    {pacingWarning && (
+                      <div className="rounded-lg border border-amber-200 dark:border-amber-900/60 bg-amber-50/70 dark:bg-amber-950/25 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
+                        {pacingWarning}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
                     <label className="block space-y-1">
                       <span className="text-slate-500">Bitrate Quality</span>
                       <select
@@ -1515,7 +1708,7 @@ export function VideoExportStudio({
 
                     <label className="block space-y-1">
                       <span className="text-slate-500">
-                        Slide Timing ({config.slideDurationSec.toFixed(1)}s)
+                        Auto Slide Pace ({config.slideDurationSec.toFixed(1)}s)
                       </span>
                       <input
                         type="range"
@@ -1523,30 +1716,15 @@ export function VideoExportStudio({
                         max={10}
                         step={0.5}
                         value={config.slideDurationSec}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          setCustomDurationOpen(false);
                           updateConfig((c) => ({
                             ...c,
                             slideDurationSec: Number(e.target.value),
                             customTotalDurationSec: null,
-                          }))
-                        }
-                        className="w-full accent-rose-700 mt-2"
-                      />
-                    </label>
-
-                    <label className="block space-y-1">
-                      <span className="text-slate-500">Custom Total (sec)</span>
-                      <input
-                        type="number"
-                        min={5}
-                        max={600}
-                        placeholder="Auto"
-                        value={config.customTotalDurationSec ?? ''}
-                        onChange={(e) => {
-                          const v = e.target.value ? Math.max(5, Math.min(600, Number(e.target.value))) : null;
-                          updateConfig((c) => ({ ...c, customTotalDurationSec: v }));
+                          }));
                         }}
-                        className="w-full min-h-[40px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono"
+                        className="w-full accent-rose-700 mt-2"
                       />
                     </label>
                   </div>
@@ -1559,12 +1737,16 @@ export function VideoExportStudio({
                       </span>
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
+                          const target = Math.max(5, Math.min(600, Math.round(audioSourceDurationSec)));
+                          setCustomDurationOpen(![10, 15, 30, 45, 60].includes(target));
+                          setCustomDurationUnit('seconds');
+                          setCustomDurationInput(String(target));
                           updateConfig((c) => ({
                             ...c,
-                            customTotalDurationSec: Math.max(5, Math.min(600, Math.round(audioSourceDurationSec))),
-                          }))
-                        }
+                            customTotalDurationSec: target,
+                          }));
+                        }}
                         className="min-h-[34px] px-3 rounded-lg border border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-[11px] font-medium hover:bg-rose-50 dark:hover:bg-rose-950/30"
                       >
                         Match Full Audio ({Math.round(audioSourceDurationSec)}s)
@@ -1641,14 +1823,27 @@ export function VideoExportStudio({
                     <div className="rounded-2xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50/50 dark:bg-emerald-950/20 p-4 space-y-3">
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-300 font-semibold text-xs">
-                          <CheckCircle2 className="w-4 h-4" />
+                          <CheckCircle2 className="w-4 h-4 shrink-0" />
                           <span>
                             Verified {exportedResult.format.toUpperCase()} Ready (
                             {(exportedResult.sizeBytes / (1024 * 1024)).toFixed(2)} MB)
                           </span>
                         </div>
-                        <span className="font-mono text-[11px] text-slate-500">
-                          {exportedResult.width}×{exportedResult.height}
+                        <span className="font-mono text-[11px] text-slate-500 shrink-0">
+                          {exportedResult.width}×{exportedResult.height} ·{' '}
+                          {exportedResult.durationSec.toFixed(1)}s
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-600 dark:text-slate-300">
+                        <span>
+                          Video: <strong>{exportedResult.videoCodec || exportedResult.format.toUpperCase()}</strong>
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span>
+                          {exportedResult.hasAudioTrack
+                            ? `Audio Verified (${exportedResult.audioCodec || 'Audio Track'})`
+                            : 'Silent Video (Music Disabled)'}
                         </span>
                       </div>
 

@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { STUDIO_ASSETS } from '../lib/assets';
+import { sanitizePresentationCaption } from '../lib/captionUtils';
 import { PHOTO_TRANSITIONS, resolvePhotoTransition } from '../lib/catalog';
 import type { UploadProgressInfo } from '../lib/cloudinaryService';
 import { searchLicensedStockPhotos, uploadMediaFile, type StockPhotoResult } from '../lib/imageUtils';
@@ -97,7 +98,7 @@ export function PhotoManagerPanel({
         const file = selectedFiles[i];
         const kind = inferMediaKind(file);
         setUploadStatusText(
-          `Uploading ${kind} (${i + 1}/${selectedFiles.length}): ${file.name}`
+          `Uploading ${kind} (${i + 1}/${selectedFiles.length})...`
         );
         setUploadProgress({ loadedBytes: 0, totalBytes: file.size, percent: 0 });
 
@@ -111,7 +112,7 @@ export function PhotoManagerPanel({
             id: replaceTargetId || `ph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             url: res.url,
             mediaType: kind,
-            caption: file.name.replace(/\.[^.]+$/, '').slice(0, 60),
+            caption: '',
             sourceType: 'uploaded',
             cloudinaryPublicId: res.publicId,
             mimeType: file.type,
@@ -138,7 +139,7 @@ export function PhotoManagerPanel({
             break;
           }
           failures.push(file);
-          latestError = err instanceof Error ? err.message : `Failed to upload ${file.name}.`;
+          latestError = err instanceof Error ? err.message : `Failed to upload ${kind} #${i + 1}.`;
         }
       }
 
@@ -245,7 +246,7 @@ export function PhotoManagerPanel({
         id: `ph_${Date.now()}_ext`,
         url: clean,
         mediaType: externalKind,
-        caption: externalCaption.trim() || (externalKind === 'video' ? 'Linked Video' : 'Linked Image'),
+        caption: sanitizePresentationCaption(externalCaption),
         sourceType: 'external-url',
         license: 'External Link (User Provided)',
         isCover: photos.length === 0,
@@ -293,7 +294,11 @@ export function PhotoManagerPanel({
   const imagePool = photos.filter((p) => p.mediaType !== 'video');
   const previewPool =
     imagePool.length > 0
-      ? imagePool.map((p) => ({ url: p.url, caption: p.caption || 'Selected Photo', tx: resolvePhotoTransition(p.transition) }))
+      ? imagePool.map((p, idx) => ({
+          url: p.url,
+          caption: sanitizePresentationCaption(p.caption) || `Memory ${idx + 1}`,
+          tx: resolvePhotoTransition(p.transition),
+        }))
       : [
           { url: STUDIO_ASSETS.heroGift, caption: 'Studio Sample · Velvet Keepsake', tx: normalizedDefaultTx },
           { url: STUDIO_ASSETS.floral, caption: 'Studio Sample · Pressed Peonies', tx: normalizedDefaultTx },
@@ -724,7 +729,7 @@ export function PhotoManagerPanel({
                         type="text"
                         value={photo.caption || ''}
                         onChange={(e) => updatePhoto(photo.id, { caption: e.target.value })}
-                        placeholder="Caption..."
+                        placeholder="Optional memory caption (leave blank for clean visual display)"
                         className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent text-xs outline-none focus:border-rose-600"
                       />
                       <select

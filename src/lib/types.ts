@@ -14,6 +14,8 @@ export type AnimationEffectId =
   | 'opening-envelope'
   | 'animated-cake'
   | 'candle-effects'
+  | 'cake-cutting'
+  | 'birthday-bunting'
   | 'romantic-transitions'
   | 'elegant-text-reveal'
   | 'card-3d-open';
@@ -157,6 +159,8 @@ export interface ExportedVideoAttachment {
   width: number;
   height: number;
   sizeBytes: number;
+  hasAudioTrack?: boolean;
+  audioCodec?: string;
   attachedAt: string;
 }
 
@@ -307,6 +311,7 @@ export interface CustomQuestionPrompt {
 }
 
 export interface VerificationMeta {
+  enableAge?: boolean;
   enableBirthdayDay: boolean;
   enableBirthdayMonth: boolean;
   enableBirthdayYear: boolean;
@@ -316,6 +321,7 @@ export interface VerificationMeta {
 }
 
 export interface VerificationSecretsInput {
+  age?: number | null;
   birthDay?: number | null;
   birthMonth?: number | null;
   birthYear?: number | null;
@@ -405,4 +411,34 @@ export interface ModeBEncryptedEnvelope {
   publishedAt: string;
 }
 
+export interface ModeBEncryptedEnvelopeV3 {
+  schemaVersion: 3;
+  cardId: string;
+  accessMode: 'interactive';
+  kdf: {
+    algorithm: 'PBKDF2-SHA256';
+    iterations: number;
+    salt: string; // base64url
+    checks: {
+      askAge: true;
+      askBirthMonth: true;
+      askBirthYear: true;
+    };
+    maxRetries: number;
+    friendlyErrorMessage: string;
+  };
+  encryption: {
+    algorithm: 'AES-256-GCM';
+    iv: string; // base64url
+    ciphertext: string; // base64url
+  };
+  securityNotice: string;
+  /** Optional generic non-sensitive hints shown on unlock screen (never plaintext secrets) */
+  teaser?: {
+    recipientHint?: string;
+    senderHint?: string;
+  };
+  publishedAt: string;
+}
 
+export type AnyModeBEnvelope = ModeBEncryptedEnvelope | ModeBEncryptedEnvelopeV3;

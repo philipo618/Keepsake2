@@ -17,7 +17,9 @@ import {
   X,
 } from 'lucide-react';
 import { AnimationCanvas, triggerConfettiCelebration } from './AnimationCanvas';
+import { BirthdayBunting, CelebrationStage } from './CelebrationStage';
 import { audioEngine } from '../lib/audioEngine';
+import { sanitizePresentationCaption } from '../lib/captionUtils';
 import { resolvePhotoTransition } from '../lib/catalog';
 import type {
   ExperienceStepKey,
@@ -44,7 +46,7 @@ export function GreetingExperience({
   const [slideIndex, setSlideIndex] = useState(0);
   const [prevSlideIndex, setPrevSlideIndex] = useState<number | null>(null);
   const prevSlideRef = useRef(0);
-  const [candlesLit, setCandlesLit] = useState(true);
+  const [slideshowPaused, setSlideshowPaused] = useState(false);
   const [viewMode, setViewMode] = useState<PresentationMode>(
     greeting.designConfig.presentationMode || 'interactive-card'
   );
@@ -93,7 +95,7 @@ export function GreetingExperience({
   );
 
   useEffect(() => {
-    if (!opened || photos.length <= 1) return;
+    if (!opened || photos.length <= 1 || slideshowPaused) return;
     if (viewMode === 'fullscreen-slideshow' || greeting.designConfig.photoLayout === 'slideshow') {
       const timer = window.setInterval(() => {
         setSlideIndex((prev) => {
@@ -104,7 +106,14 @@ export function GreetingExperience({
       }, slideshowIntervalMs);
       return () => window.clearInterval(timer);
     }
-  }, [opened, photos.length, viewMode, greeting.designConfig.photoLayout, slideshowIntervalMs]);
+  }, [
+    opened,
+    photos.length,
+    slideshowPaused,
+    viewMode,
+    greeting.designConfig.photoLayout,
+    slideshowIntervalMs,
+  ]);
 
   const startConfiguredMusic = async () => {
     if (!greeting.musicConfig?.enabled) return;
@@ -148,8 +157,8 @@ export function GreetingExperience({
     setOpened(false);
     setSlideIndex(0);
     setPrevSlideIndex(null);
+    setSlideshowPaused(false);
     setStoryStep(0);
-    setCandlesLit(true);
   };
 
   const toggleMusic = () => {
@@ -206,6 +215,8 @@ export function GreetingExperience({
   const hasCake =
     greeting.animations.includes('animated-cake') ||
     greeting.animations.includes('candle-effects');
+  const hasCakeCutting = greeting.animations.includes('cake-cutting');
+  const hasBunting = greeting.animations.includes('birthday-bunting');
 
   const getTransitionClass = (photo: PhotoItem) => {
     const tx = resolvePhotoTransition(photo.transition || design.defaultPhotoTransition);
@@ -221,6 +232,8 @@ export function GreetingExperience({
   ) => {
     const isBroken = brokenImages[photo.id];
     const isVideo = photo.mediaType === 'video';
+    const cleanCaption = sanitizePresentationCaption(photo.caption);
+    const hasAttribution = photo.sourceType !== 'uploaded' && Boolean(photo.attribution);
     const txClass = getTransitionClass(photo);
     const txStyle = {
       ['--photo-tx-duration' as string]: `${transitionDurationMs}ms`,
@@ -270,7 +283,7 @@ export function GreetingExperience({
               ) : (
                 <img
                   src={photo.url}
-                  alt={photo.caption || `Memory ${idx + 1}`}
+                  alt={cleanCaption || `Memory ${idx + 1}`}
                   referrerPolicy="no-referrer"
                   loading="lazy"
                   onError={() => setBrokenImages((prev) => ({ ...prev, [photo.id]: true }))}
@@ -284,14 +297,14 @@ export function GreetingExperience({
             ) : (
               <div className="relative z-10 w-full h-full flex flex-col items-center justify-center p-4 text-center opacity-70">
                 <ImageIcon className="w-8 h-8 mb-2" />
-                <span className="text-xs">{photo.caption || 'Memory Media'}</span>
+                <span className="text-xs">{cleanCaption || 'Memory Media'}</span>
               </div>
             )}
           </div>
-          {(photo.caption || photo.attribution) && (
+          {(cleanCaption || hasAttribution) && (
             <figcaption className="px-3 py-2 text-xs opacity-85 flex items-center justify-between gap-2">
-              <span className="truncate">{photo.caption || ''}</span>
-              {photo.sourceType !== 'uploaded' && photo.attribution && (
+              {cleanCaption ? <span className="truncate">{cleanCaption}</span> : <span />}
+              {hasAttribution && (
                 <span className="opacity-65 shrink-0 text-[11px]">{photo.attribution}</span>
               )}
             </figcaption>
@@ -317,45 +330,14 @@ export function GreetingExperience({
             >
               {greeting.title}
             </h1>
-            {hasCake && (
-              <div className="pt-3 flex flex-col items-center">
-                <div className="relative inline-flex flex-col items-center">
-                  {/* Candles */}
-                  <div className="flex items-end gap-3 mb-0.5">
-                    {[0, 1, 2].map((c) => (
-                      <div key={c} className="flex flex-col items-center">
-                        {candlesLit ? (
-                          <div className="w-2.5 h-4 rounded-full bg-amber-300 shadow-[0_0_12px_#F59E0B] animate-candle-flicker mb-0.5" />
-                        ) : (
-                          <div className="w-1 h-2 bg-slate-400/50 rounded-full mb-1" />
-                        )}
-                        <div className="w-2 h-6 rounded-sm bg-rose-200 border border-rose-300/60" />
-                      </div>
-                    ))}
-                  </div>
-                  {/* Cake tier */}
-                  <div
-                    className="w-32 h-10 rounded-t-xl border border-white/25 shadow-sm flex items-center justify-center text-[11px] font-medium"
-                    style={{ backgroundColor: design.accentColor, color: '#FFFFFF' }}
-                  >
-                    Make a Wish
-                  </div>
-                  <div className="w-36 h-3 rounded-b-lg bg-white/80 dark:bg-slate-200/80" />
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCandlesLit((prev) => !prev);
-                    if (candlesLit && greeting.musicConfig?.soundEffectsEnabled !== false) {
-                      audioEngine.playSfx('confetti');
-                      triggerConfettiCelebration(design.accentColor);
-                    }
-                  }}
-                  className="mt-2 min-h-[36px] px-3 py-1 rounded-lg border border-current/20 text-xs font-medium hover:bg-white/10 transition-colors"
-                >
-                  {candlesLit ? 'Tap to Blow Out Candles' : 'Relight Candles'}
-                </button>
-              </div>
+            {(hasCake || hasCakeCutting) && (
+              <CelebrationStage
+                showCandleCake={hasCake}
+                showCakeCutting={hasCakeCutting}
+                accentColor={design.accentColor}
+                recipientName={greeting.recipientName}
+                soundEffectsEnabled={greeting.musicConfig?.soundEffectsEnabled !== false}
+              />
             )}
           </div>
         );
@@ -374,26 +356,55 @@ export function GreetingExperience({
                   `slide-${slideIndex}`
                 )}
                 {photos.length > 1 && (
-                  <div className="mt-3 flex items-center justify-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => goToSlide((prev) => prev - 1)}
-                      className="min-h-[44px] min-w-[44px] rounded-full border border-current/20 flex items-center justify-center hover:bg-white/10"
-                      aria-label="Previous photo"
-                    >
-                      <ChevronLeft className="w-4 h-4" />
-                    </button>
-                    <span className="text-xs font-mono tabular-nums opacity-75">
-                      {(slideIndex % photos.length) + 1} / {photos.length}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => goToSlide((prev) => prev + 1)}
-                      className="min-h-[44px] min-w-[44px] rounded-full border border-current/20 flex items-center justify-center hover:bg-white/10"
-                      aria-label="Next photo"
-                    >
-                      <ChevronRight className="w-4 h-4" />
-                    </button>
+                  <div className="mt-3 flex flex-col items-center gap-2">
+                    <div className="flex items-center justify-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={() => goToSlide((prev) => prev - 1)}
+                        className="min-h-[44px] min-w-[44px] rounded-full border border-current/20 flex items-center justify-center hover:bg-white/10"
+                        aria-label="Previous photo"
+                      >
+                        <ChevronLeft className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSlideshowPaused((p) => !p)}
+                        className="min-h-[44px] px-3.5 rounded-full border border-current/20 flex items-center gap-1.5 text-xs font-medium hover:bg-white/10"
+                        aria-label={slideshowPaused ? 'Play slideshow' : 'Pause slideshow'}
+                      >
+                        {slideshowPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
+                        <span>{slideshowPaused ? 'Resume' : 'Pause'}</span>
+                      </button>
+                      <span className="text-xs font-mono tabular-nums opacity-75 px-1">
+                        {(slideIndex % photos.length) + 1} / {photos.length}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => goToSlide((prev) => prev + 1)}
+                        className="min-h-[44px] min-w-[44px] rounded-full border border-current/20 flex items-center justify-center hover:bg-white/10"
+                        aria-label="Next photo"
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                    {photos.length <= 12 && (
+                      <div className="flex items-center justify-center gap-1.5">
+                        {photos.map((p, idx) => (
+                          <button
+                            key={p.id || idx}
+                            type="button"
+                            onClick={() => goToSlide(() => idx)}
+                            aria-label={`View slide ${idx + 1}`}
+                            className={`h-2 rounded-full transition-all ${
+                              slideIndex % photos.length === idx
+                                ? 'w-5 opacity-100'
+                                : 'w-2 opacity-35 hover:opacity-65'
+                            }`}
+                            style={{ backgroundColor: design.accentColor }}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -497,6 +508,8 @@ export function GreetingExperience({
         accentColor={design.accentColor}
         active={true}
       />
+
+      {opened && hasBunting && <BirthdayBunting accentColor={design.accentColor} />}
 
       {/* Decorative Stickers Layer */}
       {opened && design.stickers && design.stickers.length > 0 && (
@@ -692,7 +705,7 @@ export function GreetingExperience({
                 <>
                   <img
                     src={activeFullscreenPhoto.url}
-                    alt={activeFullscreenPhoto.caption || greeting.title}
+                    alt={sanitizePresentationCaption(activeFullscreenPhoto.caption) || greeting.title}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
                     style={{
@@ -705,32 +718,42 @@ export function GreetingExperience({
                       {greeting.title}
                     </h2>
                     <p className="mt-2 text-sm sm:text-base text-white/90 max-w-2xl line-clamp-3">
-                      {activeFullscreenPhoto.caption || greeting.mainMessage}
+                      {sanitizePresentationCaption(activeFullscreenPhoto.caption) || greeting.mainMessage}
                     </p>
                   </div>
                 </>
               )}
             </div>
 
-            <div className="flex items-center justify-center gap-4">
-              <button
-                type="button"
-                onClick={() => goToSlide((prev) => prev - 1)}
-                className="min-h-[44px] px-4 rounded-xl bg-black/25 hover:bg-black/35 text-sm font-medium"
-              >
-                Previous
-              </button>
-              <span className="text-xs font-mono tabular-nums">
-                {(slideIndex % photos.length) + 1} / {photos.length}
-              </span>
-              <button
-                type="button"
-                onClick={() => goToSlide((prev) => prev + 1)}
-                className="min-h-[44px] px-4 rounded-xl bg-black/25 hover:bg-black/35 text-sm font-medium"
-              >
-                Next
-              </button>
-            </div>
+            {photos.length > 1 && (
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => goToSlide((prev) => prev - 1)}
+                  className="min-h-[44px] px-4 rounded-xl bg-black/25 hover:bg-black/35 text-sm font-medium"
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSlideshowPaused((p) => !p)}
+                  className="min-h-[44px] px-4 rounded-xl bg-black/25 hover:bg-black/35 text-sm font-medium inline-flex items-center gap-1.5"
+                >
+                  {slideshowPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+                  <span>{slideshowPaused ? 'Play' : 'Pause'}</span>
+                </button>
+                <span className="text-xs font-mono tabular-nums">
+                  {(slideIndex % photos.length) + 1} / {photos.length}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => goToSlide((prev) => prev + 1)}
+                  className="min-h-[44px] px-4 rounded-xl bg-black/25 hover:bg-black/35 text-sm font-medium"
+                >
+                  Next
+                </button>
+              </div>
+            )}
           </div>
         ) : viewMode === 'cinematic-story' ? (
           <div className="w-full max-w-2xl mx-auto rounded-2xl p-6 sm:p-10 shadow-xl border border-white/15 backdrop-blur-md space-y-6" style={{ backgroundColor: design.surfaceColor, color: design.textColor }}>
