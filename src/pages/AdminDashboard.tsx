@@ -1,226 +1,187 @@
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  Database,
-  Lock,
+  Activity,
+  CheckCircle2,
+  Cloud,
+  Download,
+  ExternalLink,
+  HardDrive,
   Plus,
   RefreshCw,
-  ShieldAlert,
+  RotateCcw,
   ShieldCheck,
   Trash2,
+  WifiOff,
 } from 'lucide-react';
 import { useApp } from '../components/AppContext';
+import { ANIMATION_LIBRARY, PHOTO_TRANSITIONS } from '../lib/catalog';
 import {
-  adminAddModerator,
-  adminDeleteCategory,
-  adminDeleteGreetingReport,
-  adminDeleteMediaAsset,
-  adminDeleteTemplate,
-  adminFetchActivityLogs,
-  adminFetchAdmins,
-  adminFetchAllGreetings,
-  adminFetchGreetingReports,
-  adminFetchUsers,
-  adminRemoveModerator,
-  adminSaveCategory,
-  adminSaveMediaAsset,
-  adminSavePlatformSettings,
-  adminSaveTemplate,
-  adminUpdateGreeting,
-  deleteGreetingDraft,
-  fetchCategories,
-  fetchMediaLibrary,
-  fetchPlatformSettings,
-  fetchTemplates,
-  seedDefaultCatalogToFirestore,
-} from '../lib/firestoreService';
-import { ANIMATION_LIBRARY } from '../lib/catalog';
+  checkCloudinaryConnectivity,
+  CLOUDINARY_FREE_LIMITS,
+} from '../lib/cloudinaryService';
+import {
+  clearUploadDiagnostics,
+  deleteDraftFromIndexedDb,
+  deletePublishedCardRecord,
+  getLocalStorageUsageSummary,
+  listDraftsFromIndexedDb,
+  listPublishedCardRecords,
+  listUploadDiagnostics,
+  loadLocalCategories,
+  loadLocalMediaAssets,
+  loadLocalSettings,
+  loadLocalTemplates,
+  resetLocalCatalogToDefaults,
+  saveCloudinaryRuntimeOverride,
+  saveLocalCategories,
+  saveLocalMediaAssets,
+  saveLocalSettings,
+  saveLocalTemplates,
+  type DraftRecord,
+} from '../lib/indexedDbService';
 import type { AppRoute } from '../components/Navbar';
 import type {
-  ActivityLog,
-  AdminUser,
   Category,
-  CreatorUser,
-  Greeting,
-  GreetingReport,
   MediaAsset,
+  PhotoTransitionType,
   PlatformSettings,
+  PublishedCardRecord,
   Template,
+  UploadDiagnosticRecord,
+  VideoAspectRatio,
 } from '../lib/types';
 
-type AdminTab =
-  | 'overview'
-  | 'greetings'
+type StudioSettingsTab =
+  | 'diagnostics'
+  | 'projects'
+  | 'settings'
   | 'categories'
   | 'templates'
-  | 'media'
-  | 'settings'
-  | 'security';
+  | 'media';
 
 export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => void }) {
-  const { user, authReady, isAdmin, signInWithGoogle, logout, refreshCatalog } = useApp();
+  const { cloudinary, refreshCatalog, refreshCloudinaryConfig } = useApp();
 
-  const [tab, setTab] = useState<AdminTab>('overview');
-  const [loading, setLoading] = useState(false);
+  const [tab, setTab] = useState<StudioSettingsTab>('diagnostics');
+  const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  const [greetings, setGreetings] = useState<Greeting[]>([]);
+  const [drafts, setDrafts] = useState<DraftRecord[]>([]);
+  const [published, setPublished] = useState<PublishedCardRecord[]>([]);
+  const [uploadLogs, setUploadLogs] = useState<UploadDiagnosticRecord[]>([]);
+  const [usageSummary, setUsageSummary] = useState({
+    draftsCount: 0,
+    publishedCount: 0,
+    tempBlobsCount: 0,
+    tempBlobBytes: 0,
+  });
+
   const [categories, setCategories] = useState<Category[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
   const [mediaAssets, setMediaAssets] = useState<MediaAsset[]>([]);
   const [platformSettings, setPlatformSettings] = useState<PlatformSettings | null>(null);
-  const [users, setUsers] = useState<CreatorUser[]>([]);
-  const [admins, setAdmins] = useState<AdminUser[]>([]);
-  const [logs, setLogs] = useState<ActivityLog[]>([]);
-  const [reports, setReports] = useState<GreetingReport[]>([]);
 
-  const [greetingSearch, setGreetingSearch] = useState('');
+  // Local Cloudinary override form
+  const [overrideCloudName, setOverrideCloudName] = useState('');
+  const [overrideUploadPreset, setOverrideUploadPreset] = useState('');
+  const [connectivityStatus, setConnectivityStatus] = useState<{
+    checked: boolean;
+    reachable: boolean;
+    message: string;
+  } | null>(null);
+  const [checkingConn, setCheckingConn] = useState(false);
 
-  // Form states for Category / Template / Media / Admin
+  // Edit modals
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [editingTemplate, setEditingTemplate] = useState<Template | null>(null);
   const [editingMedia, setEditingMedia] = useState<MediaAsset | null>(null);
-  const [newAdminUid, setNewAdminUid] = useState('');
-  const [newAdminEmail, setNewAdminEmail] = useState('');
-  const [newAdminRole, setNewAdminRole] = useState<'moderator' | 'super_admin'>('moderator');
 
-  const loadAllAdminData = async () => {
+  const loadStudioData = async () => {
     setLoading(true);
     try {
-      const [g, c, t, m, s, u, a, l, r] = await Promise.all([
-        adminFetchAllGreetings(),
-        fetchCategories(true),
-        fetchTemplates(true),
-        fetchMediaLibrary(true),
-        fetchPlatformSettings(),
-        adminFetchUsers(),
-        adminFetchAdmins(),
-        adminFetchActivityLogs(),
-        adminFetchGreetingReports(),
+      const [d, p, logs, summary, cats, tpls, media, cfg] = await Promise.all([
+        listDraftsFromIndexedDb(),
+        listPublishedCardRecords(),
+        listUploadDiagnostics(),
+        getLocalStorageUsageSummary(),
+        loadLocalCategories(),
+        loadLocalTemplates(),
+        loadLocalMediaAssets(),
+        loadLocalSettings(),
       ]);
-      setGreetings(g);
-      setCategories(c);
-      setTemplates(t);
-      setMediaAssets(m);
-      setPlatformSettings(s);
-      setUsers(u);
-      setAdmins(a);
-      setLogs(l);
-      setReports(r);
-    } catch (err) {
-      setNotice({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to load admin records.',
-      });
+      setDrafts(d);
+      setPublished(p);
+      setUploadLogs(logs);
+      setUsageSummary(summary);
+      setCategories(cats);
+      setTemplates(tpls);
+      setMediaAssets(media);
+      setPlatformSettings(cfg);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    if (authReady && user && isAdmin) {
-      loadAllAdminData();
-    }
-  }, [authReady, user, isAdmin]);
+    loadStudioData();
+  }, []);
 
-  if (!authReady) {
-    return (
-      <main className="min-h-[70vh] flex items-center justify-center px-4 text-sm text-slate-500">
-        Verifying administrator session...
-      </main>
-    );
-  }
+  useEffect(() => {
+    setOverrideCloudName(cloudinary.cloudName || '');
+    setOverrideUploadPreset(cloudinary.uploadPreset || '');
+  }, [cloudinary.cloudName, cloudinary.uploadPreset]);
 
-  if (!user) {
-    return (
-      <main className="min-h-[75vh] flex items-center justify-center px-4">
-        <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-8 text-center space-y-5 shadow-sm">
-          <div className="w-12 h-12 mx-auto rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
-            <Lock className="w-6 h-6 text-slate-700 dark:text-slate-200" />
-          </div>
-          <div className="space-y-2">
-            <h1 className="font-display text-2xl font-semibold text-slate-900 dark:text-white">
-              Administrator Login
-            </h1>
-            <p className="text-sm text-slate-600 dark:text-slate-400">
-              Sign in with an authorized administrator Google account. Public visitors cannot register for admin access.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => signInWithGoogle()}
-            className="w-full min-h-[48px] rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-sm font-medium hover:opacity-90"
-          >
-            Sign In with Google
-          </button>
-          <button
-            type="button"
-            onClick={() => navigate({ page: 'landing' })}
-            className="text-xs text-slate-500 hover:underline"
-          >
-            Return to Public Site
-          </button>
-        </div>
-      </main>
-    );
-  }
-
-  if (!isAdmin) {
-    return (
-      <main className="min-h-[75vh] flex items-center justify-center px-4">
-        <div className="w-full max-w-md rounded-2xl border border-rose-200 dark:border-rose-900/60 bg-white dark:bg-[#131924] p-8 text-center space-y-4">
-          <ShieldAlert className="w-10 h-10 text-rose-600 mx-auto" />
-          <h1 className="font-display text-2xl font-semibold text-slate-900 dark:text-white">
-            Access Denied
-          </h1>
-          <p className="text-sm text-slate-600 dark:text-slate-400">
-            Account <span className="font-medium">{user.email || user.uid}</span> is not in the authorized administrator allowlist.
-          </p>
-          <div className="flex flex-wrap justify-center gap-3 pt-2">
-            <button
-              type="button"
-              onClick={logout}
-              className="min-h-[44px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-medium"
-            >
-              Sign Out &amp; Switch Account
-            </button>
-            <button
-              type="button"
-              onClick={() => navigate({ page: 'landing' })}
-              className="min-h-[44px] px-4 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium"
-            >
-              Back to Home
-            </button>
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  const totalViews = greetings.reduce((acc, g) => acc + (g.viewCount || 0), 0);
-  const publishedCount = greetings.filter((g) => g.status === 'published').length;
-  const filteredGreetings = greetings.filter((g) => {
-    const q = greetingSearch.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      g.title.toLowerCase().includes(q) ||
-      g.recipientName.toLowerCase().includes(q) ||
-      g.senderName.toLowerCase().includes(q) ||
-      g.id.toLowerCase().includes(q)
-    );
-  });
-
-  const handleSeedCatalog = async () => {
-    setLoading(true);
+  const handleRunConnectivityCheck = async () => {
+    setCheckingConn(true);
     try {
-      await seedDefaultCatalogToFirestore();
-      await loadAllAdminData();
-      await refreshCatalog();
-      setNotice({ type: 'success', text: 'Default categories, templates, media library, and settings synced to Firestore.' });
-    } catch (err) {
-      setNotice({ type: 'error', text: err instanceof Error ? err.message : 'Seed failed.' });
+      const res = await checkCloudinaryConnectivity();
+      setConnectivityStatus({
+        checked: true,
+        reachable: res.reachable,
+        message: res.message,
+      });
     } finally {
-      setLoading(false);
+      setCheckingConn(false);
     }
+  };
+
+  const handleSaveCloudinaryOverride = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveCloudinaryRuntimeOverride({
+      cloudName: overrideCloudName,
+      uploadPreset: overrideUploadPreset,
+    });
+    await refreshCloudinaryConfig();
+    setNotice({
+      type: 'success',
+      text: 'Cloudinary runtime settings saved locally in IndexedDB.',
+    });
+  };
+
+  const handleClearCloudinaryOverride = async () => {
+    await saveCloudinaryRuntimeOverride(null);
+    await refreshCloudinaryConfig();
+    setNotice({
+      type: 'success',
+      text: 'Local Cloudinary override cleared; reverted to Vite environment configuration.',
+    });
+  };
+
+  const handleExportLocalBackup = () => {
+    const backup = {
+      exportedAt: new Date().toISOString(),
+      app: 'Keepsake2',
+      drafts,
+      published,
+      settings: platformSettings,
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `keepsake2_local_backup_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -228,27 +189,28 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-200 dark:border-slate-800">
         <div>
-          <div className="flex items-center gap-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+          <div className="flex items-center gap-2 text-xs font-medium text-rose-700 dark:text-rose-400">
             <ShieldCheck className="w-4 h-4" />
-            <span>Authorized Administrator · {user.email}</span>
+            <span>Static Client Architecture · Zero Backend</span>
           </div>
           <h1 className="font-display text-2xl sm:text-3xl font-semibold text-slate-900 dark:text-white mt-1">
-            Platform Administration
+            Studio Settings &amp; Cloudinary Diagnostics
           </h1>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={handleSeedCatalog}
+          <a
+            href="https://console.cloudinary.com/"
+            target="_blank"
+            rel="noopener noreferrer"
             className="min-h-[40px] px-3.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
           >
-            <Database className="w-3.5 h-3.5" />
-            <span>Seed Default Catalog</span>
-          </button>
+            <ExternalLink className="w-3.5 h-3.5" />
+            <span>Open Cloudinary Console</span>
+          </a>
           <button
             type="button"
-            onClick={loadAllAdminData}
+            onClick={loadStudioData}
             className="min-h-[40px] px-3.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium flex items-center gap-1.5 hover:bg-slate-50 dark:hover:bg-slate-800"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
@@ -276,13 +238,12 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
         {(
           [
-            { id: 'overview', label: 'Overview' },
-            { id: 'greetings', label: `Greetings (${greetings.length})` },
+            { id: 'diagnostics', label: 'Cloudinary & Diagnostics' },
+            { id: 'projects', label: `Local Projects (${drafts.length + published.length})` },
+            { id: 'settings', label: 'App Defaults' },
             { id: 'categories', label: `Categories (${categories.length})` },
             { id: 'templates', label: `Templates (${templates.length})` },
-            { id: 'media', label: `Media (${mediaAssets.length})` },
-            { id: 'settings', label: 'Platform Settings' },
-            { id: 'security', label: 'Users & Security' },
+            { id: 'media', label: `Custom Audio (${mediaAssets.length})` },
           ] as const
         ).map((t) => (
           <button
@@ -300,150 +261,279 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
         ))}
       </div>
 
-      {/* A. OVERVIEW */}
-      {tab === 'overview' && (
+      {/* TAB 1: CLOUDINARY STATUS & DIAGNOSTICS */}
+      {tab === 'diagnostics' && (
         <div className="space-y-6">
-          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-            <StatCard label="Total Greetings" value={greetings.length} />
-            <StatCard label="Published Cards" value={publishedCount} />
-            <StatCard label="Total Views" value={totalViews} />
-            <StatCard label="Open Reports" value={reports.length} />
-            <StatCard label="Templates" value={templates.length} />
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <StatCard label="Local Drafts" value={usageSummary.draftsCount} />
+            <StatCard label="Published Cards" value={usageSummary.publishedCount} />
+            <StatCard
+              label="IndexedDB Temp Blobs"
+              value={`${usageSummary.tempBlobsCount} (${(usageSummary.tempBlobBytes / (1024 * 1024)).toFixed(1)} MB)`}
+            />
+            <StatCard label="Upload Events Logged" value={uploadLogs.length} />
           </div>
 
-          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-3">
-            <div className="flex items-center justify-between">
-              <h2 className="font-semibold text-base text-slate-900 dark:text-white">
-                Reported Greetings ({reports.length})
-              </h2>
-            </div>
-            {reports.length === 0 ? (
-              <p className="text-sm text-slate-500">No abuse or moderation reports submitted.</p>
-            ) : (
-              <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                {reports.map((rep) => {
-                  const target = greetings.find((g) => g.id === rep.greetingId);
-                  return (
-                    <div
-                      key={rep.id}
-                      className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                    >
-                      <div className="space-y-0.5">
-                        <p className="font-medium text-slate-900 dark:text-white">
-                          {target ? target.title : `Greeting ${rep.greetingId}`}
-                          <span className="ml-2 font-mono text-[11px] text-slate-400">
-                            {rep.greetingId}
-                          </span>
-                        </p>
-                        <p className="text-slate-600 dark:text-slate-300">Reason: {rep.reason}</p>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2 shrink-0">
-                        {target && target.status === 'published' && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              await adminUpdateGreeting(target.id, { status: 'unpublished' });
-                              await loadAllAdminData();
-                            }}
-                            className="px-2.5 py-1.5 rounded-lg border border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-300 font-medium"
-                          >
-                            Unpublish Card
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            await adminDeleteGreetingReport(rep.id);
-                            await loadAllAdminData();
-                          }}
-                          className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
-                        >
-                          Dismiss Report
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Cloudinary Live Config & Override */}
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="font-semibold text-base text-slate-900 dark:text-white flex items-center gap-2">
+                  <Cloud className="w-4 h-4 text-rose-700 dark:text-rose-400" />
+                  <span>Cloudinary Unsigned Configuration</span>
+                </h2>
+                <span
+                  className={`px-2.5 py-1 rounded-full text-[11px] font-medium ${
+                    cloudinary.source === 'unconfigured'
+                      ? 'bg-amber-100 dark:bg-amber-950/50 text-amber-800 dark:text-amber-300'
+                      : 'bg-emerald-100 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300'
+                  }`}
+                >
+                  {cloudinary.source === 'env'
+                    ? 'Active via Vite Env'
+                    : cloudinary.source === 'local-override'
+                    ? 'Active via Browser Override'
+                    : 'Not Configured'}
+                </span>
               </div>
-            )}
+
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/40 p-3 text-xs space-y-1">
+                <p className="font-medium text-slate-800 dark:text-slate-200">
+                  Security Guarantee: Unsigned Direct Upload Only
+                </p>
+                <p className="text-slate-600 dark:text-slate-400">
+                  Only <code className="font-mono">VITE_CLOUDINARY_CLOUD_NAME</code> and{' '}
+                  <code className="font-mono">VITE_CLOUDINARY_UPLOAD_PRESET</code> are used in the browser.
+                  Your Cloudinary API Secret is never included or stored in client code.
+                </p>
+              </div>
+
+              <form onSubmit={handleSaveCloudinaryOverride} className="space-y-3 text-xs">
+                <label className="block space-y-1">
+                  <span className="font-medium text-slate-700 dark:text-slate-300">Cloud Name</span>
+                  <input
+                    type="text"
+                    value={overrideCloudName}
+                    onChange={(e) => setOverrideCloudName(e.target.value)}
+                    placeholder="e.g., dxyz123abc"
+                    className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono"
+                  />
+                </label>
+                <label className="block space-y-1">
+                  <span className="font-medium text-slate-700 dark:text-slate-300">
+                    Unsigned Upload Preset
+                  </span>
+                  <input
+                    type="text"
+                    value={overrideUploadPreset}
+                    onChange={(e) => setOverrideUploadPreset(e.target.value)}
+                    placeholder="e.g., keepsake_unsigned"
+                    className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono"
+                  />
+                </label>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="submit"
+                    className="min-h-[40px] px-4 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-medium"
+                  >
+                    Save Browser Override
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRunConnectivityCheck}
+                    disabled={checkingConn}
+                    className="min-h-[40px] px-4 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-medium flex items-center gap-1.5"
+                  >
+                    <Activity className="w-3.5 h-3.5" />
+                    <span>{checkingConn ? 'Checking...' : 'Run Connectivity Check'}</span>
+                  </button>
+                  {cloudinary.source === 'local-override' && (
+                    <button
+                      type="button"
+                      onClick={handleClearCloudinaryOverride}
+                      className="min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
+                    >
+                      Clear Override
+                    </button>
+                  )}
+                </div>
+              </form>
+
+              {connectivityStatus && (
+                <div
+                  className={`rounded-xl border p-3 text-xs flex items-start gap-2 ${
+                    connectivityStatus.reachable
+                      ? 'border-emerald-200 dark:border-emerald-900 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-900 dark:text-emerald-200'
+                      : 'border-amber-200 dark:border-amber-900 bg-amber-50/70 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200'
+                  }`}
+                >
+                  {connectivityStatus.reachable ? (
+                    <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+                  ) : (
+                    <WifiOff className="w-4 h-4 shrink-0 mt-0.5" />
+                  )}
+                  <span>{connectivityStatus.message}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Free Tier Limits & Preset Checklist */}
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-4 text-xs">
+              <h2 className="font-semibold text-base text-slate-900 dark:text-white">
+                Cloudinary Free-Tier Limits &amp; Preset Setup
+              </h2>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <p className="text-slate-500">Images &amp; Card JSON</p>
+                  <p className="font-mono text-sm font-semibold text-slate-900 dark:text-white mt-0.5">
+                    Max {CLOUDINARY_FREE_LIMITS.imageMaxBytes / (1024 * 1024)} MB
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3">
+                  <p className="text-slate-500">Videos &amp; Audio Tracks</p>
+                  <p className="font-mono text-sm font-semibold text-slate-900 dark:text-white mt-0.5">
+                    Max {CLOUDINARY_FREE_LIMITS.videoAudioMaxBytes / (1024 * 1024)} MB (chunked &gt; 20 MB)
+                  </p>
+                </div>
+              </div>
+              <ul className="space-y-1.5 text-slate-600 dark:text-slate-300 list-disc pl-4">
+                <li>Signing Mode in Cloudinary must be set to <strong>Unsigned</strong>.</li>
+                <li>Resource Type access should permit <strong>Auto / Image / Video / Raw</strong>.</li>
+                <li>Allow custom <code className="font-mono">public_id</code> or keep Overwrite disabled (Keepsake2 automatically handles randomized public IDs cleanly).</li>
+                <li>Media &amp; card storage usage, moderation, and deletion can be managed directly in Cloudinary Media Library.</li>
+              </ul>
+            </div>
           </div>
 
+          {/* Upload Diagnostics Table */}
           <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-3">
-            <h2 className="font-semibold text-base text-slate-900 dark:text-white">Recent Activity Logs</h2>
-            {logs.length === 0 ? (
-              <p className="text-sm text-slate-500">No activity logs recorded yet.</p>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="font-semibold text-base text-slate-900 dark:text-white">
+                Recent Upload Diagnostics ({uploadLogs.length})
+              </h2>
+              {uploadLogs.length > 0 && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await clearUploadDiagnostics();
+                    setUploadLogs([]);
+                  }}
+                  className="min-h-[34px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium"
+                >
+                  Clear Log
+                </button>
+              )}
+            </div>
+
+            {uploadLogs.length === 0 ? (
+              <p className="text-sm text-slate-500">
+                No Cloudinary uploads logged in this browser yet. Encryption keys are never logged.
+              </p>
             ) : (
-              <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                {logs.slice(0, 12).map((log) => (
-                  <div key={log.id} className="py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs">
-                    <div>
-                      <span className="font-mono font-medium text-slate-900 dark:text-white">{log.action}</span>
-                      {log.details && <span className="text-slate-500 ml-2">{log.details}</span>}
-                    </div>
-                    <span className="font-mono tabular-nums text-slate-400">
-                      Actor: {log.actorId.slice(0, 10)}…
-                    </span>
-                  </div>
-                ))}
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
+                    <tr>
+                      <th className="p-2.5 font-medium">File / Kind</th>
+                      <th className="p-2.5 font-medium">Size</th>
+                      <th className="p-2.5 font-medium">Mode</th>
+                      <th className="p-2.5 font-medium">Status</th>
+                      <th className="p-2.5 font-medium">Duration</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {uploadLogs.slice(0, 20).map((rec) => (
+                      <tr key={rec.id}>
+                        <td className="p-2.5">
+                          <p className="font-medium text-slate-900 dark:text-white truncate max-w-xs">
+                            {rec.fileName}
+                          </p>
+                          <p className="text-[11px] text-slate-400">
+                            {rec.kind} · {rec.resourceType}
+                            {rec.errorMessage ? ` · ${rec.errorMessage}` : ''}
+                          </p>
+                        </td>
+                        <td className="p-2.5 font-mono tabular-nums">
+                          {(rec.bytes / 1024).toFixed(1)} KB
+                        </td>
+                        <td className="p-2.5">{rec.chunked ? 'Chunked' : 'Single'}</td>
+                        <td className="p-2.5 capitalize">
+                          <span
+                            className={
+                              rec.status === 'success'
+                                ? 'text-emerald-600 font-medium'
+                                : 'text-rose-600 font-medium'
+                            }
+                          >
+                            {rec.status}
+                          </span>
+                        </td>
+                        <td className="p-2.5 font-mono tabular-nums">{rec.durationMs} ms</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
         </div>
       )}
 
-      {/* B. GREETING MANAGEMENT */}
-      {tab === 'greetings' && (
+      {/* TAB 2: LOCAL PROJECTS & EXPORT */}
+      {tab === 'projects' && (
         <div className="space-y-4">
-          <input
-            type="search"
-            value={greetingSearch}
-            onChange={(e) => setGreetingSearch(e.target.value)}
-            placeholder="Search by title, recipient, sender, or ID..."
-            className="w-full sm:w-80 min-h-[42px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#131924] text-sm"
-          />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="font-semibold text-base text-slate-900 dark:text-white flex items-center gap-2">
+              <HardDrive className="w-4 h-4 text-rose-700 dark:text-rose-400" />
+              <span>Local Browser Projects (IndexedDB)</span>
+            </h2>
+            <button
+              type="button"
+              onClick={handleExportLocalBackup}
+              className="min-h-[40px] px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-medium flex items-center gap-1.5"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Export JSON Backup</span>
+            </button>
+          </div>
 
           <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
                 <tr>
                   <th className="p-3.5 font-medium">Title / ID</th>
-                  <th className="p-3.5 font-medium">Recipient → Sender</th>
-                  <th className="p-3.5 font-medium">Status</th>
-                  <th className="p-3.5 font-medium">Access</th>
-                  <th className="p-3.5 font-medium">Views</th>
+                  <th className="p-3.5 font-medium">Recipient</th>
+                  <th className="p-3.5 font-medium">Type</th>
+                  <th className="p-3.5 font-medium">Updated</th>
                   <th className="p-3.5 font-medium text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {filteredGreetings.map((g) => (
-                  <tr key={g.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/30">
+                {drafts.map((d) => (
+                  <tr key={d.greeting.id}>
                     <td className="p-3.5">
-                      <p className="font-medium text-slate-900 dark:text-white">{g.title}</p>
-                      <p className="font-mono text-[11px] text-slate-400">{g.id}</p>
+                      <p className="font-medium text-slate-900 dark:text-white">
+                        {d.greeting.title || 'Untitled Draft'}
+                      </p>
+                      <p className="font-mono text-[11px] text-slate-400">{d.greeting.id}</p>
                     </td>
-                    <td className="p-3.5 text-slate-600 dark:text-slate-300">
-                      {g.recipientName} ← {g.senderName}
-                    </td>
-                    <td className="p-3.5 capitalize">{g.status}</td>
-                    <td className="p-3.5 capitalize">{g.accessMode}</td>
-                    <td className="p-3.5 font-mono tabular-nums">{g.viewCount ?? 0}</td>
+                    <td className="p-3.5">{d.greeting.recipientName || '—'}</td>
+                    <td className="p-3.5 capitalize">{d.greeting.status} Draft</td>
+                    <td className="p-3.5">{new Date(d.updatedAt).toLocaleDateString()}</td>
                     <td className="p-3.5 text-right space-x-2 whitespace-nowrap">
                       <button
                         type="button"
-                        onClick={async () => {
-                          const nextStatus = g.status === 'published' ? 'unpublished' : 'published';
-                          await adminUpdateGreeting(g.id, { status: nextStatus });
-                          loadAllAdminData();
-                        }}
+                        onClick={() => navigate({ page: 'create', editId: d.greeting.id })}
                         className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
                       >
-                        {g.status === 'published' ? 'Unpublish' : 'Publish'}
+                        Edit
                       </button>
                       <button
                         type="button"
                         onClick={async () => {
-                          await deleteGreetingDraft(g.id);
-                          loadAllAdminData();
+                          await deleteDraftFromIndexedDb(d.greeting.id);
+                          loadStudioData();
                         }}
                         className="px-2.5 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900 text-rose-600 font-medium"
                       >
@@ -452,10 +542,45 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
                     </td>
                   </tr>
                 ))}
-                {filteredGreetings.length === 0 && (
+                {published.map((p) => (
+                  <tr key={`pub-${p.cardId}`}>
+                    <td className="p-3.5">
+                      <p className="font-medium text-slate-900 dark:text-white">{p.title}</p>
+                      <p className="font-mono text-[11px] text-slate-400">{p.cardId}</p>
+                    </td>
+                    <td className="p-3.5">{p.recipientName}</td>
+                    <td className="p-3.5">
+                      Published ({p.accessMode === 'interactive' ? 'Mode B Encrypted' : 'Mode A'})
+                    </td>
+                    <td className="p-3.5">{new Date(p.publishedAt).toLocaleDateString()}</td>
+                    <td className="p-3.5 text-right space-x-2 whitespace-nowrap">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await navigator.clipboard.writeText(p.shareUrl).catch(() => {});
+                          setNotice({ type: 'success', text: 'Copied share link to clipboard.' });
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
+                      >
+                        Copy Link
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await deletePublishedCardRecord(p.cardId);
+                          loadStudioData();
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900 text-rose-600 font-medium"
+                      >
+                        Forget
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {drafts.length === 0 && published.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="p-8 text-center text-slate-500">
-                      No greetings found.
+                    <td colSpan={5} className="p-8 text-center text-slate-500">
+                      No local drafts or published card history stored in IndexedDB yet.
                     </td>
                   </tr>
                 )}
@@ -465,11 +590,148 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
         </div>
       )}
 
-      {/* C. CATEGORY MANAGEMENT */}
+      {/* TAB 3: APP SETTINGS & DEFAULTS */}
+      {tab === 'settings' && platformSettings && (
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            await saveLocalSettings(platformSettings);
+            await refreshCatalog();
+            setNotice({ type: 'success', text: 'Studio defaults saved locally in IndexedDB.' });
+          }}
+          className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-6 space-y-4 max-w-2xl"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="font-semibold text-base text-slate-900 dark:text-white">
+              App Settings &amp; Default Layout Preferences
+            </h2>
+            <button
+              type="button"
+              onClick={async () => {
+                await resetLocalCatalogToDefaults();
+                await loadStudioData();
+                await refreshCatalog();
+                setNotice({ type: 'success', text: 'All local catalog items and settings reset to factory defaults.' });
+              }}
+              className="min-h-[34px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium flex items-center gap-1.5"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset Defaults</span>
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Site Name</span>
+              <input
+                type="text"
+                value={platformSettings.siteName}
+                onChange={(e) => setPlatformSettings({ ...platformSettings, siteName: e.target.value })}
+                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
+              />
+            </label>
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Default Theme</span>
+              <select
+                value={platformSettings.defaultTheme}
+                onChange={(e) =>
+                  setPlatformSettings({ ...platformSettings, defaultTheme: e.target.value as 'light' | 'dark' })
+                }
+                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+              >
+                <option value="light">Light Theme</option>
+                <option value="dark">Dark Theme</option>
+              </select>
+            </label>
+          </div>
+
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Hero Headline</span>
+            <input
+              type="text"
+              value={platformSettings.heroTitle || ''}
+              onChange={(e) => setPlatformSettings({ ...platformSettings, heroTitle: e.target.value })}
+              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
+            />
+          </label>
+          <label className="block space-y-1">
+            <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Hero Subtitle</span>
+            <textarea
+              rows={3}
+              value={platformSettings.heroSubtitle || ''}
+              onChange={(e) => setPlatformSettings({ ...platformSettings, heroSubtitle: e.target.value })}
+              className="w-full p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
+            />
+          </label>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Max Media Items</span>
+              <input
+                type="number"
+                min={1}
+                max={24}
+                value={platformSettings.maxPhotosPerCard}
+                onChange={(e) =>
+                  setPlatformSettings({ ...platformSettings, maxPhotosPerCard: Number(e.target.value) })
+                }
+                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
+              />
+            </label>
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Default Transition</span>
+              <select
+                value={platformSettings.defaultPhotoTransition || 'fade'}
+                onChange={(e) =>
+                  setPlatformSettings({
+                    ...platformSettings,
+                    defaultPhotoTransition: e.target.value as PhotoTransitionType,
+                  })
+                }
+                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+              >
+                {PHOTO_TRANSITIONS.map((tx) => (
+                  <option key={tx.id} value={tx.id}>
+                    {tx.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block space-y-1">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Video Aspect Ratio</span>
+              <select
+                value={platformSettings.defaultAspectRatio || '16:9'}
+                onChange={(e) =>
+                  setPlatformSettings({
+                    ...platformSettings,
+                    defaultAspectRatio: e.target.value as VideoAspectRatio,
+                  })
+                }
+                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+              >
+                <option value="16:9">16:9 Landscape</option>
+                <option value="9:16">9:16 Portrait</option>
+                <option value="1:1">1:1 Square</option>
+              </select>
+            </label>
+          </div>
+
+          <button
+            type="submit"
+            className="min-h-[44px] px-6 rounded-xl bg-rose-700 text-white text-sm font-medium"
+          >
+            Save Settings
+          </button>
+        </form>
+      )}
+
+      {/* TAB 4: CATEGORIES */}
       {tab === 'categories' && (
         <div className="space-y-4">
           <div className="flex justify-between items-center">
-            <h2 className="font-semibold text-base text-slate-900 dark:text-white">Manage Greeting Categories</h2>
+            <h2 className="font-semibold text-base text-slate-900 dark:text-white">
+              Local Greeting Categories
+            </h2>
             <button
               type="button"
               onClick={() =>
@@ -518,8 +780,9 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
                   <button
                     type="button"
                     onClick={async () => {
-                      await adminDeleteCategory(cat.id);
-                      await loadAllAdminData();
+                      const next = categories.filter((c) => c.id !== cat.id);
+                      await saveLocalCategories(next);
+                      setCategories(next);
                       await refreshCatalog();
                     }}
                     className="min-h-[36px] px-3 rounded-lg text-rose-600 text-xs font-medium ml-auto"
@@ -533,11 +796,11 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
         </div>
       )}
 
-      {/* D. TEMPLATE MANAGEMENT */}
+      {/* TAB 5: TEMPLATES */}
       {tab === 'templates' && (
         <div className="space-y-4">
           <div className="flex justify-between items-center">
-            <h2 className="font-semibold text-base text-slate-900 dark:text-white">Manage Design Templates</h2>
+            <h2 className="font-semibold text-base text-slate-900 dark:text-white">Local Design Templates</h2>
             <button
               type="button"
               onClick={() =>
@@ -592,8 +855,9 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
                   <button
                     type="button"
                     onClick={async () => {
-                      await adminDeleteTemplate(tpl.id);
-                      await loadAllAdminData();
+                      const next = templates.filter((t) => t.id !== tpl.id);
+                      await saveLocalTemplates(next);
+                      setTemplates(next);
                       await refreshCatalog();
                     }}
                     className="min-h-[36px] px-3 rounded-lg text-rose-600 text-xs font-medium ml-auto"
@@ -607,11 +871,13 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
         </div>
       )}
 
-      {/* E. MEDIA MANAGEMENT */}
+      {/* TAB 6: CUSTOM MEDIA ASSETS */}
       {tab === 'media' && (
         <div className="space-y-4">
           <div className="flex justify-between items-center">
-            <h2 className="font-semibold text-base text-slate-900 dark:text-white">Platform Media Library</h2>
+            <h2 className="font-semibold text-base text-slate-900 dark:text-white">
+              Custom Audio &amp; Studio Assets
+            </h2>
             <button
               type="button"
               onClick={() =>
@@ -620,7 +886,7 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
                   type: 'music',
                   title: '',
                   url: '',
-                  license: 'Royalty-Free Platform License',
+                  license: 'User Provided / Royalty-Free',
                   attribution: '',
                   category: 'celebration',
                   enabled: true,
@@ -629,254 +895,56 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
               className="min-h-[40px] px-4 rounded-xl bg-rose-700 text-white text-xs font-medium flex items-center gap-1.5"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Add Media Asset</span>
+              <span>Add Custom Track</span>
             </button>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {mediaAssets.map((asset) => (
-              <div
-                key={asset.id}
-                className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-4 space-y-2"
-              >
-                <div className="flex items-center justify-between text-xs text-slate-500">
-                  <span className="uppercase font-medium">{asset.type}</span>
-                  <span>{asset.enabled ? 'Enabled' : 'Disabled'}</span>
-                </div>
-                <p className="font-medium text-sm text-slate-900 dark:text-white">{asset.title}</p>
-                <p className="text-xs text-slate-500 truncate">{asset.license}</p>
-                <div className="flex items-center gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => setEditingMedia(asset)}
-                    className="min-h-[36px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await adminDeleteMediaAsset(asset.id);
-                      await loadAllAdminData();
-                    }}
-                    className="min-h-[36px] px-3 rounded-lg text-rose-600 text-xs font-medium ml-auto"
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* F. PLATFORM SETTINGS */}
-      {tab === 'settings' && platformSettings && (
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            await adminSavePlatformSettings(platformSettings);
-            await refreshCatalog();
-            setNotice({ type: 'success', text: 'Platform settings updated across the live site.' });
-          }}
-          className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-6 space-y-4 max-w-2xl"
-        >
-          <h2 className="font-semibold text-base text-slate-900 dark:text-white">Global Platform Settings</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <label className="block space-y-1">
-              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Website Name</span>
-              <input
-                type="text"
-                value={platformSettings.siteName}
-                onChange={(e) => setPlatformSettings({ ...platformSettings, siteName: e.target.value })}
-                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Default Theme</span>
-              <select
-                value={platformSettings.defaultTheme}
-                onChange={(e) =>
-                  setPlatformSettings({ ...platformSettings, defaultTheme: e.target.value as 'light' | 'dark' })
-                }
-                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
-              >
-                <option value="light">Light Theme</option>
-                <option value="dark">Dark Theme</option>
-              </select>
-            </label>
-          </div>
-          <label className="block space-y-1">
-            <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Hero Headline</span>
-            <input
-              type="text"
-              value={platformSettings.heroTitle || ''}
-              onChange={(e) => setPlatformSettings({ ...platformSettings, heroTitle: e.target.value })}
-              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
-            />
-          </label>
-          <label className="block space-y-1">
-            <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Hero Subtitle</span>
-            <textarea
-              rows={3}
-              value={platformSettings.heroSubtitle || ''}
-              onChange={(e) => setPlatformSettings({ ...platformSettings, heroSubtitle: e.target.value })}
-              className="w-full p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
-            />
-          </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <label className="block space-y-1">
-              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Max Photos Per Card</span>
-              <input
-                type="number"
-                min={1}
-                max={20}
-                value={platformSettings.maxPhotosPerCard}
-                onChange={(e) =>
-                  setPlatformSettings({ ...platformSettings, maxPhotosPerCard: Number(e.target.value) })
-                }
-                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
-              />
-            </label>
-            <label className="block space-y-1">
-              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Max Upload Size (MB)</span>
-              <input
-                type="number"
-                min={1}
-                max={25}
-                value={platformSettings.maxUploadSizeMb}
-                onChange={(e) =>
-                  setPlatformSettings({ ...platformSettings, maxUploadSizeMb: Number(e.target.value) })
-                }
-                className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm"
-              />
-            </label>
-          </div>
-          <div className="flex flex-wrap gap-6 pt-2">
-            <label className="flex items-center gap-2 text-xs font-medium">
-              <input
-                type="checkbox"
-                checked={platformSettings.allowGuestCreation}
-                onChange={(e) =>
-                  setPlatformSettings({ ...platformSettings, allowGuestCreation: e.target.checked })
-                }
-                className="accent-rose-700"
-              />
-              <span>Allow Guest Anonymous Creation</span>
-            </label>
-            <label className="flex items-center gap-2 text-xs font-medium">
-              <input
-                type="checkbox"
-                checked={platformSettings.sharingEnabled}
-                onChange={(e) =>
-                  setPlatformSettings({ ...platformSettings, sharingEnabled: e.target.checked })
-                }
-                className="accent-rose-700"
-              />
-              <span>Enable Public Sharing</span>
-            </label>
-          </div>
-          <button
-            type="submit"
-            className="min-h-[44px] px-6 rounded-xl bg-rose-700 text-white text-sm font-medium"
-          >
-            Save Settings
-          </button>
-        </form>
-      )}
-
-      {/* G. USERS & SECURITY */}
-      {tab === 'security' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-4">
-            <h2 className="font-semibold text-base text-slate-900 dark:text-white">Administrator Allowlist</h2>
-            <div className="space-y-2">
-              {admins.map((a) => (
-                <div key={a.uid} className="flex items-center justify-between text-xs p-2.5 rounded-lg border border-slate-100 dark:border-slate-800">
-                  <div>
-                    <p className="font-medium text-slate-900 dark:text-white">{a.email}</p>
-                    <p className="font-mono text-[11px] text-slate-400">
-                      {a.uid} · {a.role}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await adminRemoveModerator(a.uid);
-                      loadAllAdminData();
-                    }}
-                    className="text-rose-600 p-1.5"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))}
-            </div>
-
-            <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
-              <p className="text-xs font-medium text-slate-700 dark:text-slate-300">Add Moderator / Admin UID</p>
-              <input
-                type="text"
-                value={newAdminUid}
-                onChange={(e) => setNewAdminUid(e.target.value)}
-                placeholder="Firebase User UID"
-                className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent text-xs"
-              />
-              <div className="flex gap-2">
-                <input
-                  type="email"
-                  value={newAdminEmail}
-                  onChange={(e) => setNewAdminEmail(e.target.value)}
-                  placeholder="Admin Email"
-                  className="flex-1 min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent text-xs"
-                />
-                <select
-                  value={newAdminRole}
-                  onChange={(e) => setNewAdminRole(e.target.value as 'moderator' | 'super_admin')}
-                  className="min-h-[40px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+          {mediaAssets.length === 0 ? (
+            <p className="text-sm text-slate-500 py-6 text-center border border-slate-200 dark:border-slate-800 rounded-xl">
+              No custom audio URLs added yet. Built-in studio tracks remain active in Step 5.
+            </p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {mediaAssets.map((asset) => (
+                <div
+                  key={asset.id}
+                  className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-4 space-y-2"
                 >
-                  <option value="moderator">Moderator</option>
-                  <option value="super_admin">Super Admin</option>
-                </select>
-              </div>
-              <button
-                type="button"
-                onClick={async () => {
-                  if (!newAdminUid.trim() || !newAdminEmail.trim()) return;
-                  await adminAddModerator(newAdminUid.trim(), newAdminEmail.trim(), newAdminEmail.trim(), newAdminRole);
-                  setNewAdminUid('');
-                  setNewAdminEmail('');
-                  loadAllAdminData();
-                }}
-                className="min-h-[40px] px-4 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium"
-              >
-                Grant Admin Role
-              </button>
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-3">
-            <h2 className="font-semibold text-base text-slate-900 dark:text-white">
-              Registered Creators ({users.length})
-            </h2>
-            <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-96 overflow-y-auto">
-              {users.map((u) => (
-                <div key={u.uid} className="py-2.5 flex items-center justify-between text-xs">
-                  <div>
-                    <p className="font-medium text-slate-900 dark:text-white">{u.displayName}</p>
-                    <p className="font-mono text-[11px] text-slate-400">{u.uid}</p>
+                  <div className="flex items-center justify-between text-xs text-slate-500">
+                    <span className="uppercase font-medium">{asset.type}</span>
+                    <span>{asset.enabled ? 'Enabled' : 'Disabled'}</span>
                   </div>
-                  <span className="font-mono tabular-nums text-slate-500">
-                    {u.greetingsCount} cards
-                  </span>
+                  <p className="font-medium text-sm text-slate-900 dark:text-white">{asset.title}</p>
+                  <p className="text-xs text-slate-500 truncate">{asset.license}</p>
+                  <div className="flex items-center gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setEditingMedia(asset)}
+                      className="min-h-[36px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const next = mediaAssets.filter((m) => m.id !== asset.id);
+                        await saveLocalMediaAssets(next);
+                        setMediaAssets(next);
+                        await refreshCatalog();
+                      }}
+                      className="min-h-[36px] px-3 rounded-lg text-rose-600 text-xs font-medium ml-auto"
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
-          </div>
+          )}
         </div>
       )}
 
-      {/* Modals for Category, Template, Media Editing */}
+      {/* Edit Modals */}
       {editingCategory && (
         <ModalShell title="Edit Category" onClose={() => setEditingCategory(null)}>
           <div className="space-y-3 text-xs">
@@ -919,10 +987,13 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
               <button
                 type="button"
                 onClick={async () => {
-                  const isNew = !categories.some((c) => c.id === editingCategory.id);
-                  await adminSaveCategory(editingCategory, isNew);
+                  const exists = categories.some((c) => c.id === editingCategory.id);
+                  const next = exists
+                    ? categories.map((c) => (c.id === editingCategory.id ? editingCategory : c))
+                    : [...categories, editingCategory];
+                  await saveLocalCategories(next);
+                  setCategories(next);
                   setEditingCategory(null);
-                  await loadAllAdminData();
                   await refreshCatalog();
                 }}
                 className="min-h-[40px] px-5 rounded-lg bg-rose-700 text-white font-medium"
@@ -1000,10 +1071,13 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
               <button
                 type="button"
                 onClick={async () => {
-                  const isNew = !templates.some((t) => t.id === editingTemplate.id);
-                  await adminSaveTemplate(editingTemplate, isNew);
+                  const exists = templates.some((t) => t.id === editingTemplate.id);
+                  const next = exists
+                    ? templates.map((t) => (t.id === editingTemplate.id ? editingTemplate : t))
+                    : [...templates, editingTemplate];
+                  await saveLocalTemplates(next);
+                  setTemplates(next);
                   setEditingTemplate(null);
-                  await loadAllAdminData();
                   await refreshCatalog();
                 }}
                 className="min-h-[40px] px-5 rounded-lg bg-rose-700 text-white font-medium"
@@ -1016,40 +1090,31 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
       )}
 
       {editingMedia && (
-        <ModalShell title="Edit Media Asset" onClose={() => setEditingMedia(null)}>
+        <ModalShell title="Custom Studio Asset" onClose={() => setEditingMedia(null)}>
           <div className="space-y-3 text-xs">
-            <select
-              value={editingMedia.type}
-              onChange={(e) => setEditingMedia({ ...editingMedia, type: e.target.value as MediaAsset['type'] })}
-              className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-            >
-              <option value="music">Music Track</option>
-              <option value="image">Licensed Image</option>
-              <option value="sticker">Sticker Asset</option>
-            </select>
             <input
               type="text"
               value={editingMedia.title}
               onChange={(e) => setEditingMedia({ ...editingMedia, title: e.target.value })}
-              placeholder="Title"
+              placeholder="Track Title"
               className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent"
             />
             <input
-              type="text"
+              type="url"
               value={editingMedia.url}
               onChange={(e) => setEditingMedia({ ...editingMedia, url: e.target.value })}
-              placeholder="Asset URL"
+              placeholder="Audio URL (https://...)"
               className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent"
             />
             <input
               type="text"
               value={editingMedia.license}
               onChange={(e) => setEditingMedia({ ...editingMedia, license: e.target.value })}
-              placeholder="License (e.g. CC-BY 4.0)"
+              placeholder="License Info"
               className="w-full min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent"
             />
             <div className="flex items-center justify-between pt-2">
-              <label className="flex items-center gap-1.5">
+              <label className="flex items-center gap-2">
                 <input
                   type="checkbox"
                   checked={editingMedia.enabled}
@@ -1060,10 +1125,14 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
               <button
                 type="button"
                 onClick={async () => {
-                  const isNew = !mediaAssets.some((m) => m.id === editingMedia.id);
-                  await adminSaveMediaAsset(editingMedia, isNew);
+                  const exists = mediaAssets.some((m) => m.id === editingMedia.id);
+                  const next = exists
+                    ? mediaAssets.map((m) => (m.id === editingMedia.id ? editingMedia : m))
+                    : [...mediaAssets, editingMedia];
+                  await saveLocalMediaAssets(next);
+                  setMediaAssets(next);
                   setEditingMedia(null);
-                  await loadAllAdminData();
+                  await refreshCatalog();
                 }}
                 className="min-h-[40px] px-5 rounded-lg bg-rose-700 text-white font-medium"
               >
@@ -1077,11 +1146,11 @@ export function AdminDashboard({ navigate }: { navigate: (next: AppRoute) => voi
   );
 }
 
-function StatCard({ label, value }: { label: string; value: string | number }) {
+function StatCard({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-4">
       <p className="text-xs text-slate-500 dark:text-slate-400">{label}</p>
-      <p className="font-mono tabular-nums text-2xl font-semibold text-slate-900 dark:text-white mt-1">
+      <p className="font-mono tabular-nums text-xl sm:text-2xl font-semibold text-slate-900 dark:text-white mt-1">
         {value}
       </p>
     </div>
@@ -1098,11 +1167,15 @@ function ModalShell({
   children: React.ReactNode;
 }) {
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="w-full max-w-md rounded-2xl bg-white dark:bg-[#131924] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+    <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="font-semibold text-base text-slate-900 dark:text-white">{title}</h3>
-          <button type="button" onClick={onClose} className="min-h-[36px] min-w-[36px] rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800">
+          <button
+            type="button"
+            onClick={onClose}
+            className="min-h-[36px] min-w-[36px] rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
             ✕
           </button>
         </div>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowLeft,
@@ -7,6 +7,7 @@ import {
   Check,
   Eye,
   Film,
+  Lock,
   Music,
   Pause,
   Play,
@@ -18,13 +19,14 @@ import {
   Trash2,
   Undo2,
   Upload,
+  X,
 } from 'lucide-react';
 import { useApp } from '../components/AppContext';
 import { PhotoManagerPanel } from '../components/PhotoManagerPanel';
 import { GreetingExperience } from '../components/GreetingExperience';
 import { VerificationGate } from '../components/VerificationGate';
 import { VideoExportStudio } from '../components/VideoExportStudio';
-import { ShareModal } from '../components/ShareModal';
+import { buildGreetingShareUrl, ShareModal } from '../components/ShareModal';
 import {
   ANIMATION_LIBRARY,
   createDefaultDesignConfig,
@@ -34,21 +36,27 @@ import {
   STICKER_PALETTE,
 } from '../lib/catalog';
 import { audioEngine, LICENSED_MUSIC_LIBRARY } from '../lib/audioEngine';
+import {
+  generateShortId,
+  uploadCardDocumentToCloudinary,
+  type UploadProgressInfo,
+} from '../lib/cloudinaryService';
+import { encryptModeBCardDocument } from '../lib/cryptoVault';
 import { uploadMediaFile } from '../lib/imageUtils';
 import {
-  fetchGreetingById,
-  fetchGreetingSecretForOwner,
-  fetchMediaLibrary,
-  generateShortId,
-  saveGreeting,
-} from '../lib/firestoreService';
+  getDraftFromIndexedDb,
+  listDraftsFromIndexedDb,
+  saveDraftToIndexedDb,
+  savePublishedCardRecord,
+  type DraftRecord,
+} from '../lib/indexedDbService';
 import type { AppRoute } from '../components/Navbar';
 import type {
   AnimationEffectId,
+  CardDocumentV2Public,
   CustomQuestionPrompt,
   ExperienceStepKey,
   Greeting,
-  MediaAsset,
   PhotoLayoutType,
   PresentationMode,
   Template,
@@ -126,12 +134,12 @@ export function CreatorWizard({
   initialOpenVideoStudio?: boolean;
   navigate: (next: AppRoute) => void;
 }) {
-  const { user, categories, templates, settings, promptAuth } = useApp();
+  const { categories, templates, mediaAssets, settings } = useApp();
 
   const [step, setStep] = useState(0);
   const [greeting, setGreeting] = useState<Greeting>(() => {
     const tpl = initialTemplateId ? templates.find((t) => t.id === initialTemplateId) : undefined;
-    return createInitialGreeting(user?.uid || 'guest', initialCategoryId || tpl?.categoryId || 'birthday', tpl);
+    return createInitialGreeting('local-creator', initialCategoryId || tpl?.categoryId || 'birthday', tpl);
   });
 
   const [secrets, setSecrets] = useState<VerificationSecretsInput>({
@@ -150,9 +158,11 @@ export function CreatorWizard({
   const [newQuestionAnswer, setNewQuestionAnswer] = useState('');
   const [newQuestionHint, setNewQuestionHint] = useState('');
 
-  const [adminMusicAssets, setAdminMusicAssets] = useState<MediaAsset[]>([]);
+  const adminMusicAssets = mediaAssets.filter((i) => i.type === 'music');
   const [previewPlayingId, setPreviewPlayingId] = useState<string | null>(null);
   const [audioUploading, setAudioUploading] = useState(false);
+  const [audioUploadProgress, setAudioUploadProgress] = useState<UploadProgressInfo | null>(null);
+  const audioUploadAbortRef = useRef<AbortController | null>(null);
 
   const [loadingExisting, setLoadingExisting] = useState(Boolean(editId));
   const [saving, setSaving] = useState(false);
@@ -162,8 +172,15 @@ export function CreatorWizard({
   const [videoStudioOpen, setVideoStudioOpen] = useState(Boolean(initialOpenVideoStudio));
   const [previewGateUnlocked, setPreviewGateUnlocked] = useState(false);
   const [previewResetSeed, setPreviewResetSeed] = useState(0);
-  const [publishedShareId, setPublishedShareId] = useState<string | null>(null);
+  const [publishedShare, setPublishedShare] = useState<{
+    routeCardId: string;
+    encryptionKey?: string | null;
+    isEncrypted: boolean;
+    shareUrl: string;
+  } | null>(null);
   const [externalAudioUrlInput, setExternalAudioUrlInput] = useState('');
+  const [recoverableDraft, setRecoverableDraft] = useState<DraftRecord | null>(null);
+  const hasUserEditedRef = useRef(Boolean(editId));
 
   const openFullPreview = () => {
     setPreviewGateUnlocked(false);
@@ -172,50 +189,25 @@ export function CreatorWizard({
   };
 
   useEffect(() => {
-    fetchMediaLibrary(false).then((items) => {
-      setAdminMusicAssets(items.filter((i) => i.type === 'music'));
-    });
     return () => {
       audioEngine.stop();
+      audioUploadAbortRef.current?.abort();
     };
   }, []);
 
+  // Load explicit draft from IndexedDB when editing an existing project
   useEffect(() => {
     if (!editId) return;
     let active = true;
     setLoadingExisting(true);
-    Promise.all([fetchGreetingById(editId), fetchGreetingSecretForOwner(editId)])
-      .then(([loaded, loadedSecret]) => {
-        if (!active || !loaded) return;
-        const unlocked = loadedSecret?.unlockedPayload as
-          | {
-              mainMessage?: string;
-              additionalMessages?: string[];
-              cardDate?: string;
-              signature?: string;
-              photos?: Greeting['photos'];
-              exportedVideo?: Greeting['exportedVideo'];
-            }
-          | undefined;
-
-        setGreeting({
-          ...loaded,
-          mainMessage: unlocked?.mainMessage ?? loaded.mainMessage,
-          additionalMessages: unlocked?.additionalMessages ?? loaded.additionalMessages ?? [],
-          cardDate: unlocked?.cardDate ?? loaded.cardDate ?? '',
-          signature: unlocked?.signature ?? loaded.signature ?? '',
-          photos: unlocked?.photos ?? loaded.photos ?? [],
-          exportedVideo: unlocked?.exportedVideo ?? loaded.exportedVideo ?? null,
-        });
-
-        if (loadedSecret) {
-          setSecrets({
-            birthDay: loadedSecret.birthDay ?? 15,
-            birthMonth: loadedSecret.birthMonth ?? 6,
-            birthYear: loadedSecret.birthYear ?? 1995,
-            customAnswers: loadedSecret.customAnswers || [],
-          });
+    getDraftFromIndexedDb(editId)
+      .then((draft) => {
+        if (!active || !draft) return;
+        setGreeting(draft.greeting);
+        if (draft.secrets) {
+          setSecrets(draft.secrets);
         }
+        hasUserEditedRef.current = true;
       })
       .finally(() => {
         if (active) setLoadingExisting(false);
@@ -225,7 +217,41 @@ export function CreatorWizard({
     };
   }, [editId]);
 
+  // Offer interrupted draft recovery when opening /create fresh without template/category preset
+  useEffect(() => {
+    if (editId || initialTemplateId || initialCategoryId) return;
+    let active = true;
+    listDraftsFromIndexedDb()
+      .then((drafts) => {
+        if (!active || drafts.length === 0) return;
+        const latest = drafts[0];
+        if (
+          latest &&
+          latest.greeting.status === 'draft' &&
+          (latest.greeting.recipientName?.trim() ||
+            latest.greeting.photos.length > 0 ||
+            latest.greeting.mainMessage.length > 120)
+        ) {
+          setRecoverableDraft(latest);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [editId, initialTemplateId, initialCategoryId]);
+
+  // Debounced IndexedDB auto-save once user makes changes
+  useEffect(() => {
+    if (!hasUserEditedRef.current) return;
+    const timer = window.setTimeout(() => {
+      saveDraftToIndexedDb(greeting, secrets).catch(() => {});
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [greeting, secrets]);
+
   const commitChange = (updater: (prev: Greeting) => Greeting) => {
+    hasUserEditedRef.current = true;
     setGreeting((prev) => {
       const next = updater(prev);
       setHistoryPast((p) => [...p.slice(-24), prev]);
@@ -252,7 +278,7 @@ export function CreatorWizard({
 
   const handleReset = () => {
     const tpl = greeting.templateId ? templates.find((t) => t.id === greeting.templateId) : undefined;
-    commitChange(() => createInitialGreeting(user?.uid || 'guest', greeting.categoryId, tpl));
+    commitChange(() => createInitialGreeting('local-creator', greeting.categoryId, tpl));
     setStatusMessage({ type: 'success', text: 'Card styling and fields reset to template defaults.' });
   };
 
@@ -311,14 +337,16 @@ export function CreatorWizard({
   const handleUploadAudio = async (files: FileList | null) => {
     const file = files?.[0];
     if (!file) return;
-    if (!user) {
-      promptAuth('Sign in to upload an MP3 or WAV audio file.');
-      return;
-    }
+    const controller = new AbortController();
+    audioUploadAbortRef.current = controller;
     setAudioUploading(true);
+    setAudioUploadProgress({ loadedBytes: 0, totalBytes: file.size, percent: 0 });
     setStatusMessage(null);
     try {
-      const res = await uploadMediaFile(file, greeting.id, 'audio');
+      const res = await uploadMediaFile(file, greeting.id, 'audio', {
+        signal: controller.signal,
+        onProgress: (prog) => setAudioUploadProgress(prog),
+      });
       commitChange((prev) => ({
         ...prev,
         musicConfig: {
@@ -326,18 +354,32 @@ export function CreatorWizard({
           enabled: true,
           sourceType: 'uploaded',
           audioUrl: res.url,
+          cloudinaryPublicId: res.publicId,
+          mimeType: file.type,
+          bytes: res.sizeBytes,
+          durationSec: res.durationSec,
+          localBlobId: res.localBlobId,
           trackTitle: file.name.replace(/\.[^.]+$/, '').slice(0, 80),
           trackId: 'uploaded-audio',
         },
       }));
-      setStatusMessage({ type: 'success', text: `Uploaded "${file.name}" successfully.` });
-    } catch (err) {
       setStatusMessage({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to upload audio file.',
+        type: 'success',
+        text: `Uploaded "${file.name}" (${res.durationSec ? `${res.durationSec}s · ` : ''}${(res.sizeBytes / (1024 * 1024)).toFixed(2)} MB) to Cloudinary.`,
       });
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        setStatusMessage({ type: 'error', text: 'Audio upload cancelled.' });
+      } else {
+        setStatusMessage({
+          type: 'error',
+          text: err instanceof Error ? err.message : 'Failed to upload audio file.',
+        });
+      }
     } finally {
       setAudioUploading(false);
+      setAudioUploadProgress(null);
+      audioUploadAbortRef.current = null;
     }
   };
 
@@ -347,27 +389,19 @@ export function CreatorWizard({
     if (!greeting.title.trim()) return 'Please provide a card headline in Step 3.';
     if (isPublishing && greeting.accessMode === 'interactive') {
       const v = greeting.verificationMeta;
-      const hasAnyStep =
-        v.enableBirthdayDay ||
-        v.enableBirthdayMonth ||
-        v.enableBirthdayYear ||
-        v.customQuestions.some((q) => q.enabled);
-      if (!hasAnyStep) {
-        return 'Interactive Access is selected, so enable at least one birthday or personalized question step.';
-      }
       if (v.enableBirthdayDay && (!secrets.birthDay || secrets.birthDay < 1 || secrets.birthDay > 31)) {
-        return 'Enter a valid birthday day (1–31).';
+        return 'Enter a valid birthday day (1–31) or uncheck Birth Day.';
       }
       if (v.enableBirthdayMonth && (!secrets.birthMonth || secrets.birthMonth < 1 || secrets.birthMonth > 12)) {
-        return 'Select a valid birth month.';
+        return 'Select a valid birth month or uncheck Birth Month.';
       }
       if (v.enableBirthdayYear && (!secrets.birthYear || secrets.birthYear < 1900 || secrets.birthYear > 2100)) {
-        return 'Enter a valid 4-digit birth year.';
+        return 'Enter a valid 4-digit birth year or uncheck Birth Year.';
       }
       for (const q of v.customQuestions.filter((c) => c.enabled)) {
         const ans = secrets.customAnswers.find((a) => a.id === q.id)?.answer?.trim();
         if (!ans) {
-          return `Please provide an expected answer for "${q.question}".`;
+          return `Please provide an expected answer for "${q.question}" or uncheck that question.`;
         }
       }
     }
@@ -375,19 +409,12 @@ export function CreatorWizard({
   };
 
   const handleSave = async (targetStatus: 'draft' | 'published') => {
-    if (!user) {
-      promptAuth(
-        targetStatus === 'published'
-          ? 'Sign in to publish your greeting card and generate a unique shareable link.'
-          : 'Sign in to save your greeting draft to your Keepsake studio.'
-      );
-      return;
-    }
-
-    const validationError = validateBeforeSaveOrPublish(targetStatus === 'published');
-    if (validationError) {
-      setStatusMessage({ type: 'error', text: validationError });
-      return;
+    if (targetStatus === 'published') {
+      const validationError = validateBeforeSaveOrPublish(true);
+      if (validationError) {
+        setStatusMessage({ type: 'error', text: validationError });
+        return;
+      }
     }
 
     if (targetStatus === 'published') setPublishing(true);
@@ -395,23 +422,112 @@ export function CreatorWizard({
     setStatusMessage(null);
 
     try {
-      const payload: Greeting = {
+      const nowIso = new Date().toISOString();
+      const basePayload: Greeting = {
         ...greeting,
-        creatorId: greeting.creatorId === 'guest' ? user.uid : greeting.creatorId,
         status: targetStatus,
+        createdAt: greeting.createdAt || nowIso,
+        updatedAt: nowIso,
       };
-      const saved = await saveGreeting(payload, greeting.accessMode === 'interactive' ? secrets : undefined);
-      setGreeting(saved);
-      if (targetStatus === 'published') {
-        setPublishedShareId(saved.id);
-        setStatusMessage({ type: 'success', text: 'Your greeting is published and live!' });
-      } else {
-        setStatusMessage({ type: 'success', text: 'Draft saved securely to Firestore.' });
+
+      if (targetStatus === 'draft') {
+        await saveDraftToIndexedDb(basePayload, secrets);
+        setGreeting(basePayload);
+        hasUserEditedRef.current = true;
+        setStatusMessage({ type: 'success', text: 'Draft saved locally in IndexedDB.' });
+        return;
       }
+
+      // Publish directly to Cloudinary CDN (no database, no backend).
+      // Unsigned presets disallow overwriting existing public_ids, so re-publishing an edited
+      // card mints a fresh cardId to guarantee the share link serves the updated document.
+      const publishCardId = basePayload.cloudinaryPublicId
+        ? generateShortId('ks')
+        : basePayload.id;
+      const publishPayload: Greeting = {
+        ...basePayload,
+        id: publishCardId,
+      };
+
+      let routeCardId: string;
+      let publicId: string;
+      let secureUrl: string;
+      let bytes: number;
+      let encryptionKey: string | null = null;
+      const isEncrypted = publishPayload.accessMode === 'interactive';
+
+      if (isEncrypted) {
+        const { envelope, keyBase64Url } = await encryptModeBCardDocument(
+          publishCardId,
+          publishPayload,
+          secrets
+        );
+        const uploaded = await uploadCardDocumentToCloudinary(publishCardId, envelope);
+        routeCardId = uploaded.routeCardId;
+        publicId = uploaded.publicId;
+        secureUrl = uploaded.secureUrl;
+        bytes = uploaded.bytes;
+        encryptionKey = keyBase64Url;
+      } else {
+        const publicDoc: CardDocumentV2Public = {
+          schemaVersion: 2,
+          cardId: publishCardId,
+          accessMode: 'direct',
+          publishedAt: nowIso,
+          greeting: publishPayload,
+        };
+        const uploaded = await uploadCardDocumentToCloudinary(publishCardId, publicDoc);
+        routeCardId = uploaded.routeCardId;
+        publicId = uploaded.publicId;
+        secureUrl = uploaded.secureUrl;
+        bytes = uploaded.bytes;
+      }
+
+      const shareUrl = buildGreetingShareUrl(routeCardId, encryptionKey);
+      const publishedGreeting: Greeting = {
+        ...publishPayload,
+        status: 'published',
+        cloudinaryPublicId: publicId,
+        cloudinaryUrl: secureUrl,
+        shareUrl,
+      };
+
+      await saveDraftToIndexedDb(publishedGreeting, secrets);
+      await savePublishedCardRecord({
+        cardId: routeCardId,
+        title: publishedGreeting.title,
+        recipientName: publishedGreeting.recipientName,
+        senderName: publishedGreeting.senderName,
+        categoryId: publishedGreeting.categoryId,
+        accessMode: publishedGreeting.accessMode,
+        cloudinaryPublicId: publicId,
+        cloudinaryUrl: secureUrl,
+        shareUrl,
+        publishedAt: nowIso,
+        bytes,
+        mediaCount: publishedGreeting.photos.length,
+      });
+
+      setGreeting(publishedGreeting);
+      setPublishedShare({
+        routeCardId,
+        encryptionKey,
+        isEncrypted,
+        shareUrl,
+      });
+      setStatusMessage({
+        type: 'success',
+        text: isEncrypted
+          ? 'Encrypted Mode B card published to Cloudinary! Share the full link (including #key=...) with your recipient.'
+          : 'Your greeting card is published live on Cloudinary CDN!',
+      });
     } catch (err) {
       setStatusMessage({
         type: 'error',
-        text: err instanceof Error ? err.message : 'Unable to save greeting. Check your connection and permissions.',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Unable to publish greeting. Check your Cloudinary configuration.',
       });
     } finally {
       setSaving(false);
@@ -554,6 +670,40 @@ export function CreatorWizard({
           </button>
         ))}
       </div>
+
+      {recoverableDraft && (
+        <div className="mt-4 rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/80 dark:bg-amber-950/30 p-3.5 text-xs sm:text-sm flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="font-semibold text-amber-900 dark:text-amber-100">
+              Unsaved local draft found: &ldquo;{recoverableDraft.greeting.title || 'Untitled Greeting'}&rdquo;
+            </p>
+            <p className="text-[11px] text-amber-800/80 dark:text-amber-200/80">
+              Saved {new Date(recoverableDraft.updatedAt).toLocaleString()} · Restore it into the studio or discard the notice.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setGreeting(recoverableDraft.greeting);
+                if (recoverableDraft.secrets) setSecrets(recoverableDraft.secrets);
+                hasUserEditedRef.current = true;
+                setRecoverableDraft(null);
+              }}
+              className="min-h-[36px] px-3.5 rounded-lg bg-amber-700 hover:bg-amber-800 text-white text-xs font-medium"
+            >
+              Restore Draft
+            </button>
+            <button
+              type="button"
+              onClick={() => setRecoverableDraft(null)}
+              className="min-h-[36px] px-3 rounded-lg border border-amber-300 dark:border-amber-800 text-xs font-medium"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {statusMessage && (
         <div
@@ -995,45 +1145,91 @@ export function CreatorWizard({
                 </label>
               </div>
 
-              {/* Upload Short Clip or Link External Audio */}
+              {/* Upload Full-Length Audio or Link External Audio */}
               <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 p-4 space-y-3">
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <Music className="w-5 h-5 text-rose-700 dark:text-rose-400 shrink-0" />
                     <div>
                       <p className="text-sm font-medium text-slate-900 dark:text-white">
-                        Upload Short Audio Clip (MP3 / WAV ≤ 450 KB)
+                        Upload Music / Voice Track (MP3, WAV, M4A, AAC, OGG ≤ 100 MB)
                       </p>
                       <p className="text-xs text-slate-500">
                         {greeting.musicConfig.sourceType === 'uploaded' && greeting.musicConfig.trackTitle
-                          ? `Selected: ${greeting.musicConfig.trackTitle}`
-                          : 'Free Spark tier embeds clips up to 450 KB in Firestore, or paste an external MP3/OGG URL below.'}
+                          ? `Selected: ${greeting.musicConfig.trackTitle}${
+                              greeting.musicConfig.durationSec
+                                ? ` · ${greeting.musicConfig.durationSec}s`
+                                : ''
+                            }`
+                          : 'Supports full-length songs uploaded directly to Cloudinary (auto-chunked > 20 MB), or paste an external audio URL below.'}
                       </p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <label className="min-h-[40px] px-4 py-2 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium cursor-pointer flex items-center gap-1.5">
+                    <label
+                      className={`min-h-[40px] px-4 py-2 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium flex items-center gap-1.5 ${
+                        audioUploading ? 'opacity-50 pointer-events-none' : 'cursor-pointer'
+                      }`}
+                    >
                       <Upload className="w-3.5 h-3.5" />
-                      <span>{audioUploading ? 'Processing...' : 'Upload Clip'}</span>
+                      <span>
+                        {audioUploading
+                          ? `Uploading ${audioUploadProgress?.percent ?? 0}%...`
+                          : 'Upload Audio'}
+                      </span>
                       <input
                         type="file"
-                        accept="audio/mpeg,audio/mp3,audio/wav,audio/ogg"
+                        accept="audio/mpeg,audio/mp3,audio/wav,audio/mp4,audio/x-m4a,audio/aac,audio/ogg,audio/webm"
                         disabled={audioUploading}
-                        onChange={(e) => handleUploadAudio(e.target.files)}
+                        onChange={(e) => {
+                          handleUploadAudio(e.target.files);
+                          e.target.value = '';
+                        }}
                         className="hidden"
                       />
                     </label>
-                    {greeting.musicConfig.sourceType === 'uploaded' && greeting.musicConfig.audioUrl && (
+                    {audioUploading && (
                       <button
                         type="button"
-                        onClick={() => handleAudioPreview('uploaded', greeting.musicConfig.audioUrl)}
-                        className="min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium"
+                        onClick={() => audioUploadAbortRef.current?.abort()}
+                        className="min-h-[40px] px-3 rounded-lg border border-rose-300 dark:border-rose-800 text-rose-600 text-xs font-medium flex items-center gap-1"
                       >
-                        {previewPlayingId === 'uploaded' ? 'Stop' : 'Preview'}
+                        <X className="w-3.5 h-3.5" />
+                        <span>Cancel</span>
                       </button>
                     )}
+                    {!audioUploading &&
+                      greeting.musicConfig.sourceType === 'uploaded' &&
+                      greeting.musicConfig.audioUrl && (
+                        <button
+                          type="button"
+                          onClick={() => handleAudioPreview('uploaded', greeting.musicConfig.audioUrl)}
+                          className="min-h-[40px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium"
+                        >
+                          {previewPlayingId === 'uploaded' ? 'Stop' : 'Preview'}
+                        </button>
+                      )}
                   </div>
                 </div>
+
+                {audioUploading && audioUploadProgress && (
+                  <div className="space-y-1">
+                    <div className="h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                      <div
+                        className="h-full bg-rose-700 transition-all duration-150"
+                        style={{ width: `${audioUploadProgress.percent}%` }}
+                      />
+                    </div>
+                    <p className="text-[11px] text-slate-500 font-mono">
+                      {audioUploadProgress.totalChunks
+                        ? `Chunk ${audioUploadProgress.chunkIndex}/${audioUploadProgress.totalChunks} · `
+                        : ''}
+                      {(audioUploadProgress.loadedBytes / (1024 * 1024)).toFixed(2)} /{' '}
+                      {(audioUploadProgress.totalBytes / (1024 * 1024)).toFixed(2)} MB (
+                      {audioUploadProgress.percent}%)
+                    </p>
+                  </div>
+                )}
 
                 <div className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-slate-200/70 dark:border-slate-800">
                   <input
@@ -1610,9 +1806,12 @@ export function CreatorWizard({
                       : 'border-slate-200 dark:border-slate-800'
                   }`}
                 >
-                  <p className="font-medium text-sm text-slate-900 dark:text-white">Mode B: Interactive Access</p>
+                  <p className="font-medium text-sm text-slate-900 dark:text-white flex items-center gap-1.5">
+                    <Lock className="w-3.5 h-3.5 text-rose-700 dark:text-rose-400" />
+                    <span>Mode B: Encrypted Private Card</span>
+                  </p>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    Recipient answers birthday dates or personal memory prompts to decrypt your PBKDF2 + AES-GCM sealed keepsake.
+                    Seals your card in the browser using a random AES-256-GCM key embedded strictly in the URL fragment (#key=...), plus optional birthday/memory quiz prompts inside the encrypted bundle.
                   </p>
                 </button>
               </div>
@@ -1620,11 +1819,11 @@ export function CreatorWizard({
               {greeting.accessMode === 'interactive' && (
                 <div className="space-y-5 rounded-xl border border-slate-200 dark:border-slate-800 p-4 sm:p-5 bg-slate-50/60 dark:bg-slate-900/40">
                   <div className="rounded-lg border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/30 p-3 text-xs text-emerald-800 dark:text-emerald-200">
-                    Mode B seals your greeting message and photos in-browser using Web Crypto (PBKDF2-SHA256 + AES-256-GCM) before saving to Firestore—plaintext answers are never stored in public documents.
+                    <strong>Zero-Knowledge Client Encryption:</strong> Your browser encrypts the greeting JSON with Web Crypto (<code className="font-mono">AES-256-GCM</code>) before uploading to Cloudinary. The decryption key lives exclusively in the share URL fragment (<code className="font-mono">#key=...</code>) and is never uploaded or stored on Cloudinary. Optional birthday prompts below are also sealed inside the encrypted bundle.
                   </div>
                   <div className="space-y-3">
                     <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                      Birthday Verification Sequence
+                      Optional Birthday Verification Sequence
                     </p>
 
                     {/* Day */}
@@ -2120,12 +2319,15 @@ export function CreatorWizard({
       )}
 
       {/* Share Modal after Publishing */}
-      {publishedShareId && (
+      {publishedShare && (
         <ShareModal
-          greetingId={publishedShareId}
+          greetingId={publishedShare.routeCardId}
           recipientName={greeting.recipientName || 'your recipient'}
           title={greeting.title}
-          onClose={() => setPublishedShareId(null)}
+          shareUrlOverride={publishedShare.shareUrl}
+          encryptionKey={publishedShare.encryptionKey}
+          isEncrypted={publishedShare.isEncrypted}
+          onClose={() => setPublishedShare(null)}
         />
       )}
     </main>

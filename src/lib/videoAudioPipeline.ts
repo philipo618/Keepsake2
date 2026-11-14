@@ -3,6 +3,7 @@ import type { MusicConfig } from './types';
 
 export interface RenderedAudioResult {
   buffer: AudioBuffer | null;
+  sourceDurationSec?: number;
   warning?: string;
 }
 
@@ -121,7 +122,7 @@ export async function renderMusicToAudioBuffer(
       }
 
       const rendered = await offline.startRendering();
-      return { buffer: rendered };
+      return { buffer: rendered, sourceDurationSec: Math.round(decoded.duration * 10) / 10 };
     } catch {
       return {
         buffer: null,

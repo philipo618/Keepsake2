@@ -46,7 +46,7 @@ export type PhotoTransitionType =
   | 'geometric-reveal'
   | 'layered-reveal'
   | 'camera-pan'
-  // Legacy aliases retained for existing saved Firestore cards
+  // Legacy aliases retained for backwards compatibility with saved cards
   | 'slide'
   | 'zoom'
   | 'polaroid-float';
@@ -223,17 +223,25 @@ export interface PlatformSettings {
   maxUploadSizeMb: number;
   allowGuestCreation: boolean;
   sharingEnabled: boolean;
-  updatedAt?: unknown;
+  defaultPhotoTransition?: PhotoTransitionType;
+  defaultAspectRatio?: VideoAspectRatio;
+  updatedAt?: string;
 }
 
 export interface PhotoItem {
   id: string;
   url: string;
+  mediaType?: 'image' | 'video';
   caption?: string;
   sourceType: PhotoSourceType;
   license?: string;
   attribution?: string;
   isCover?: boolean;
+  cloudinaryPublicId?: string;
+  mimeType?: string;
+  bytes?: number;
+  durationSec?: number;
+  localBlobId?: string;
   cropPosition: {
     x: number;
     y: number;
@@ -248,6 +256,11 @@ export interface MusicConfig {
   trackTitle?: string;
   sourceType: 'library' | 'uploaded' | 'none';
   audioUrl?: string;
+  cloudinaryPublicId?: string;
+  mimeType?: string;
+  bytes?: number;
+  durationSec?: number;
+  localBlobId?: string;
   volume: number;
   startTiming: 'on-gift-open' | 'after-intro' | 'manual';
   soundEffectsEnabled: boolean;
@@ -329,45 +342,67 @@ export interface Greeting {
   verificationMeta: VerificationMeta;
   status: 'draft' | 'published' | 'unpublished';
   exportedVideo?: ExportedVideoAttachment | null;
-  isReported?: boolean;
-  viewCount?: number;
-  createdAt?: unknown;
-  updatedAt?: unknown;
+  cloudinaryPublicId?: string;
+  cloudinaryUrl?: string;
+  shareUrl?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
-export interface CreatorUser {
-  uid: string;
-  displayName: string;
-  photoURL?: string;
-  isAnonymous?: boolean;
-  greetingsCount: number;
-  storageUsedBytes: number;
-  createdAt?: unknown;
-  updatedAt?: unknown;
+export interface PublishedCardRecord {
+  cardId: string;
+  title: string;
+  recipientName: string;
+  senderName: string;
+  categoryId: string;
+  accessMode: 'direct' | 'interactive';
+  cloudinaryPublicId: string;
+  cloudinaryUrl: string;
+  shareUrl: string;
+  publishedAt: string;
+  bytes: number;
+  mediaCount: number;
 }
 
-export interface AdminUser {
-  uid: string;
-  email: string;
-  displayName?: string;
-  role: 'super_admin' | 'moderator';
-  createdAt?: unknown;
-}
-
-export interface ActivityLog {
+export interface UploadDiagnosticRecord {
   id: string;
-  actorId: string;
-  action: string;
-  targetType?: string;
-  targetId?: string;
-  details?: string;
-  createdAt?: unknown;
+  kind: 'image' | 'video' | 'audio' | 'card-json';
+  resourceType: 'image' | 'video' | 'raw';
+  fileName: string;
+  bytes: number;
+  format?: string;
+  publicId?: string;
+  secureUrl?: string;
+  status: 'success' | 'failed' | 'cancelled';
+  errorMessage?: string;
+  durationMs: number;
+  chunked: boolean;
+  createdAt: string;
 }
 
-export interface GreetingReport {
-  id: string;
-  greetingId: string;
-  reason: string;
-  createdAt?: unknown;
+export interface CardDocumentV2Public {
+  schemaVersion: 2;
+  cardId: string;
+  accessMode: 'direct';
+  publishedAt: string;
+  greeting: Greeting;
 }
+
+export interface ModeBEncryptedEnvelope {
+  schemaVersion: 2;
+  cardId: string;
+  accessMode: 'interactive';
+  encryption: {
+    algorithm: 'AES-256-GCM';
+    iv: string; // base64url
+    ciphertext: string; // base64url
+  };
+  /** Optional generic teaser shown before decryption (never contains message/photos/videos) */
+  teaser?: {
+    titleHint?: string;
+    senderHint?: string;
+  };
+  publishedAt: string;
+}
+
 

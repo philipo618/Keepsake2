@@ -1,37 +1,34 @@
 import type {
   Greeting,
+  ModeBEncryptedEnvelope,
   VerificationMeta,
   VerificationSecretsInput,
 } from './types';
 
-export interface StepVerifierEntry {
-  stepKey: string;
-  verifierHash: string;
+export interface ModeBPlaintextBundle {
+  schemaVersion: 2;
+  greeting: Greeting;
+  interactiveQuiz?: {
+    verificationMeta: VerificationMeta;
+    /** Optional expected answers stored strictly INSIDE the encrypted Mode B envelope */
+    expectedSecrets: VerificationSecretsInput;
+  } | null;
 }
 
-export interface EncryptedGreetingVault {
-  greetingId: string;
-  creatorId: string;
-  kdf: 'PBKDF2-SHA256';
-  iterations: number;
-  salt: string;
-  iv: string;
-  ciphertext: string;
-  stepVerifiers: StepVerifierEntry[];
-  maxRetries: number;
-  updatedAt?: unknown;
-}
+export type ModeBDecryptErrorCode =
+  | 'MISSING_KEY'
+  | 'INVALID_KEY'
+  | 'CORRUPTED_DOCUMENT'
+  | 'WEB_CRYPTO_UNAVAILABLE';
 
-export interface SealedGreetingPayload {
-  mainMessage: string;
-  additionalMessages: string[];
-  cardDate: string;
-  signature: string;
-  photos: Greeting['photos'];
-  exportedVideo: Greeting['exportedVideo'];
+export class ModeBDecryptError extends Error {
+  readonly code: ModeBDecryptErrorCode;
+  constructor(code: ModeBDecryptErrorCode, message: string) {
+    super(message);
+    this.name = 'ModeBDecryptError';
+    this.code = code;
+  }
 }
-
-export const DEFAULT_PBKDF2_ITERATIONS = 150000;
 
 export function normalizeVerificationAnswer(val: unknown): string {
   return String(val ?? '')
@@ -40,7 +37,7 @@ export function normalizeVerificationAnswer(val: unknown): string {
     .replace(/\s+/g, ' ');
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
+export function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = '';
   const chunkSize = 0x8000;
   for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -50,8 +47,12 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-function base64UrlToBytes(str: string): Uint8Array {
-  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
+export function base64UrlToBytes(str: string): Uint8Array {
+  const clean = str.trim();
+  if (!/^[A-Za-z0-9\-_]+$/.test(clean) || clean.length === 0) {
+    throw new Error('Malformed base64url token');
+  }
+  const base64 = clean.replace(/-/g, '+').replace(/_/g, '/');
   const padLen = (4 - (base64.length % 4)) % 4;
   const padded = base64 + '='.repeat(padLen);
   const binary = atob(padded);
@@ -68,279 +69,221 @@ function toArrayBuffer(view: Uint8Array): ArrayBuffer {
   return copy.buffer;
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
 function requireWebCrypto(): SubtleCrypto {
   if (typeof globalThis === 'undefined' || !globalThis.crypto?.subtle) {
-    throw new Error('Web Crypto API is unavailable in this browser context.');
+    throw new ModeBDecryptError(
+      'WEB_CRYPTO_UNAVAILABLE',
+      'Web Crypto API is unavailable in this browser context. HTTPS is required.'
+    );
   }
   return globalThis.crypto.subtle;
 }
 
-async function deriveStepSalt(masterSalt: Uint8Array, stepKey: string): Promise<Uint8Array> {
-  const subtle = requireWebCrypto();
-  const encoder = new TextEncoder();
-  const suffix = encoder.encode(`:${stepKey}`);
-  const combined = new Uint8Array(masterSalt.length + suffix.length);
-  combined.set(masterSalt, 0);
-  combined.set(suffix, masterSalt.length);
-  const digest = await subtle.digest('SHA-256', toArrayBuffer(combined));
-  return new Uint8Array(digest).subarray(0, 16);
+/**
+ * Generates a cryptographically secure random 256-bit AES-GCM key.
+ * The key stays strictly in the client browser and is embedded ONLY in the URL fragment (#key=...).
+ */
+export function generateModeBRandomKey(): { rawBytes: Uint8Array; keyBase64Url: string } {
+  if (typeof globalThis === 'undefined' || !globalThis.crypto?.getRandomValues) {
+    throw new Error('Secure random number generator (crypto.getRandomValues) is unavailable.');
+  }
+  const rawBytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
+  return {
+    rawBytes,
+    keyBase64Url: bytesToBase64Url(rawBytes),
+  };
 }
 
-async function computeStepVerifierHash(
-  masterSalt: Uint8Array,
-  iterations: number,
-  stepKey: string,
-  normalizedValue: string
-): Promise<string> {
+/**
+ * Encrypts a Mode B card document with AES-256-GCM using a fresh 256-bit random key and 96-bit random IV.
+ * Additional Authenticated Data (AAD) binds the ciphertext strictly to the cardId.
+ */
+export async function encryptModeBCardDocument(
+  cardId: string,
+  greeting: Greeting,
+  secretsInput?: VerificationSecretsInput
+): Promise<{ envelope: ModeBEncryptedEnvelope; keyBase64Url: string }> {
   const subtle = requireWebCrypto();
   const encoder = new TextEncoder();
-  const keyMaterial = await subtle.importKey(
-    'raw',
-    toArrayBuffer(encoder.encode(`${stepKey}:${normalizedValue}`)),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  const stepSalt = await deriveStepSalt(masterSalt, stepKey);
-  const bits = await subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: toArrayBuffer(stepSalt),
-      iterations,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    256
-  );
-  return bytesToBase64Url(new Uint8Array(bits));
-}
 
-async function deriveAesGcmKey(
-  masterSalt: Uint8Array,
-  iterations: number,
-  combinedSecret: string,
-  usage: 'encrypt' | 'decrypt'
-): Promise<CryptoKey> {
-  const subtle = requireWebCrypto();
-  const encoder = new TextEncoder();
-  const baseKey = await subtle.importKey(
+  const { rawBytes, keyBase64Url } = generateModeBRandomKey();
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+
+  const cryptoKey = await subtle.importKey(
     'raw',
-    toArrayBuffer(encoder.encode(combinedSecret)),
-    'PBKDF2',
-    false,
-    ['deriveKey']
-  );
-  return subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: toArrayBuffer(masterSalt),
-      iterations,
-      hash: 'SHA-256',
-    },
-    baseKey,
+    toArrayBuffer(rawBytes),
     { name: 'AES-GCM', length: 256 },
     false,
-    [usage]
-  );
-}
-
-function buildCanonicalStepEntriesFromSecrets(
-  meta: VerificationMeta,
-  secrets: VerificationSecretsInput
-): Array<{ stepKey: string; normalizedAnswer: string }> {
-  const entries: Array<{ stepKey: string; normalizedAnswer: string }> = [];
-  if (meta.enableBirthdayDay) {
-    entries.push({
-      stepKey: 'day',
-      normalizedAnswer: normalizeVerificationAnswer(secrets.birthDay ?? ''),
-    });
-  }
-  if (meta.enableBirthdayMonth) {
-    entries.push({
-      stepKey: 'month',
-      normalizedAnswer: normalizeVerificationAnswer(secrets.birthMonth ?? ''),
-    });
-  }
-  if (meta.enableBirthdayYear) {
-    entries.push({
-      stepKey: 'year',
-      normalizedAnswer: normalizeVerificationAnswer(secrets.birthYear ?? ''),
-    });
-  }
-  if (Array.isArray(meta.customQuestions)) {
-    for (const q of meta.customQuestions) {
-      if (!q.enabled) continue;
-      const ans = secrets.customAnswers.find((a) => a.id === q.id)?.answer ?? '';
-      entries.push({
-        stepKey: `custom:${q.id}`,
-        normalizedAnswer: normalizeVerificationAnswer(ans),
-      });
-    }
-  }
-  return entries;
-}
-
-function buildCanonicalStepEntriesFromAttempt(
-  meta: VerificationMeta,
-  submitted: {
-    birthDay?: number;
-    birthMonth?: number;
-    birthYear?: number;
-    customAnswers?: Record<string, string>;
-  }
-): Array<{ stepKey: string; normalizedAnswer: string }> {
-  const entries: Array<{ stepKey: string; normalizedAnswer: string }> = [];
-  if (meta.enableBirthdayDay) {
-    entries.push({
-      stepKey: 'day',
-      normalizedAnswer: normalizeVerificationAnswer(submitted.birthDay ?? ''),
-    });
-  }
-  if (meta.enableBirthdayMonth) {
-    entries.push({
-      stepKey: 'month',
-      normalizedAnswer: normalizeVerificationAnswer(submitted.birthMonth ?? ''),
-    });
-  }
-  if (meta.enableBirthdayYear) {
-    entries.push({
-      stepKey: 'year',
-      normalizedAnswer: normalizeVerificationAnswer(submitted.birthYear ?? ''),
-    });
-  }
-  if (Array.isArray(meta.customQuestions)) {
-    for (const q of meta.customQuestions) {
-      if (!q.enabled) continue;
-      const ans = submitted.customAnswers?.[q.id] ?? '';
-      entries.push({
-        stepKey: `custom:${q.id}`,
-        normalizedAnswer: normalizeVerificationAnswer(ans),
-      });
-    }
-  }
-  return entries;
-}
-
-export async function buildEncryptedGreetingVault(
-  greetingId: string,
-  creatorId: string,
-  meta: VerificationMeta,
-  secrets: VerificationSecretsInput,
-  unlockedPayload: SealedGreetingPayload
-): Promise<Omit<EncryptedGreetingVault, 'updatedAt'>> {
-  const subtle = requireWebCrypto();
-  const encoder = new TextEncoder();
-
-  const entries = buildCanonicalStepEntriesFromSecrets(meta, secrets);
-  if (entries.length === 0) {
-    throw new Error('At least one verification step must be enabled to seal an interactive greeting.');
-  }
-
-  const masterSalt = globalThis.crypto.getRandomValues(new Uint8Array(16));
-  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
-  const iterations = DEFAULT_PBKDF2_ITERATIONS;
-
-  const stepVerifiers: StepVerifierEntry[] = await Promise.all(
-    entries.map(async (entry) => ({
-      stepKey: entry.stepKey,
-      verifierHash: await computeStepVerifierHash(
-        masterSalt,
-        iterations,
-        entry.stepKey,
-        entry.normalizedAnswer
-      ),
-    }))
+    ['encrypt']
   );
 
-  const combinedSecret = entries.map((e) => `${e.stepKey}=${e.normalizedAnswer}`).join('\n');
-  const aesKey = await deriveAesGcmKey(masterSalt, iterations, combinedSecret, 'encrypt');
+  const hasInteractiveQuestions =
+    greeting.verificationMeta.enableBirthdayDay ||
+    greeting.verificationMeta.enableBirthdayMonth ||
+    greeting.verificationMeta.enableBirthdayYear ||
+    greeting.verificationMeta.customQuestions.some((q) => q.enabled);
 
-  const plaintextBytes = encoder.encode(JSON.stringify(unlockedPayload));
+  const bundle: ModeBPlaintextBundle = {
+    schemaVersion: 2,
+    greeting: {
+      ...greeting,
+      id: cardId,
+      accessMode: 'interactive',
+      status: 'published',
+    },
+    interactiveQuiz:
+      hasInteractiveQuestions && secretsInput
+        ? {
+            verificationMeta: greeting.verificationMeta,
+            expectedSecrets: secretsInput,
+          }
+        : null,
+  };
+
+  const plaintextBytes = encoder.encode(JSON.stringify(bundle));
   const encryptedBuffer = await subtle.encrypt(
     {
       name: 'AES-GCM',
       iv: toArrayBuffer(iv),
-      additionalData: toArrayBuffer(encoder.encode(greetingId)),
+      additionalData: toArrayBuffer(encoder.encode(cardId)),
     },
-    aesKey,
+    cryptoKey,
     toArrayBuffer(plaintextBytes)
   );
 
-  return {
-    greetingId,
-    creatorId,
-    kdf: 'PBKDF2-SHA256',
-    iterations,
-    salt: bytesToBase64Url(masterSalt),
-    iv: bytesToBase64Url(iv),
-    ciphertext: bytesToBase64Url(new Uint8Array(encryptedBuffer)),
-    stepVerifiers,
-    maxRetries: typeof meta.maxRetries === 'number' && meta.maxRetries >= 0 ? meta.maxRetries : 5,
+  const envelope: ModeBEncryptedEnvelope = {
+    schemaVersion: 2,
+    cardId,
+    accessMode: 'interactive',
+    encryption: {
+      algorithm: 'AES-256-GCM',
+      iv: bytesToBase64Url(iv),
+      ciphertext: bytesToBase64Url(new Uint8Array(encryptedBuffer)),
+    },
+    publishedAt: new Date().toISOString(),
   };
+
+  return { envelope, keyBase64Url };
 }
 
-export async function verifyVaultStep(
-  vault: EncryptedGreetingVault,
-  stepKey: string,
-  candidateValue: unknown
-): Promise<boolean> {
-  const target = vault.stepVerifiers.find((v) => v.stepKey === stepKey);
-  if (!target) return false;
-  const masterSalt = base64UrlToBytes(vault.salt);
-  const candidateHash = await computeStepVerifierHash(
-    masterSalt,
-    vault.iterations,
-    stepKey,
-    normalizeVerificationAnswer(candidateValue)
-  );
-  return timingSafeEqual(candidateHash, target.verifierHash);
-}
-
-export async function decryptGreetingVault(
-  vault: EncryptedGreetingVault,
-  greetingId: string,
-  meta: VerificationMeta,
-  submitted: {
-    birthDay?: number;
-    birthMonth?: number;
-    birthYear?: number;
-    customAnswers?: Record<string, string>;
+/**
+ * Decrypts a Mode B encrypted card envelope using ONLY the key from the URL fragment.
+ * Explicitly fails with structured ModeBDecryptError when the key is missing, invalid, or document is corrupted.
+ */
+export async function decryptModeBCardDocument(
+  envelope: ModeBEncryptedEnvelope,
+  keyBase64Url: string | null | undefined
+): Promise<ModeBPlaintextBundle> {
+  if (!keyBase64Url || !keyBase64Url.trim()) {
+    throw new ModeBDecryptError(
+      'MISSING_KEY',
+      'This private greeting card requires the decryption key from the original share link fragment (#key=...).'
+    );
   }
-): Promise<SealedGreetingPayload | null> {
+
+  if (
+    !envelope ||
+    envelope.accessMode !== 'interactive' ||
+    envelope.encryption?.algorithm !== 'AES-256-GCM' ||
+    !envelope.encryption?.iv ||
+    !envelope.encryption?.ciphertext ||
+    !envelope.cardId
+  ) {
+    throw new ModeBDecryptError(
+      'CORRUPTED_DOCUMENT',
+      'The encrypted greeting document is malformed or missing required encryption metadata.'
+    );
+  }
+
+  let keyBytes: Uint8Array;
+  try {
+    keyBytes = base64UrlToBytes(keyBase64Url);
+  } catch {
+    throw new ModeBDecryptError(
+      'INVALID_KEY',
+      'The decryption key in this link is malformed or incomplete.'
+    );
+  }
+
+  if (keyBytes.byteLength !== 32) {
+    throw new ModeBDecryptError(
+      'INVALID_KEY',
+      'Invalid AES-256 decryption key length. Please check that the full link was copied.'
+    );
+  }
+
+  let ivBytes: Uint8Array;
+  let ciphertextBytes: Uint8Array;
+  try {
+    ivBytes = base64UrlToBytes(envelope.encryption.iv);
+    ciphertextBytes = base64UrlToBytes(envelope.encryption.ciphertext);
+  } catch {
+    throw new ModeBDecryptError(
+      'CORRUPTED_DOCUMENT',
+      'The encrypted card payload appears corrupted and cannot be decoded.'
+    );
+  }
+
   const subtle = requireWebCrypto();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
-  const entries = buildCanonicalStepEntriesFromAttempt(meta, submitted);
-  if (entries.length === 0) return null;
-
-  const masterSalt = base64UrlToBytes(vault.salt);
-  const iv = base64UrlToBytes(vault.iv);
-  const ciphertext = base64UrlToBytes(vault.ciphertext);
-
-  const combinedSecret = entries.map((e) => `${e.stepKey}=${e.normalizedAnswer}`).join('\n');
+  let cryptoKey: CryptoKey;
   try {
-    const aesKey = await deriveAesGcmKey(masterSalt, vault.iterations, combinedSecret, 'decrypt');
-    const decryptedBuffer = await subtle.decrypt(
+    cryptoKey = await subtle.importKey(
+      'raw',
+      toArrayBuffer(keyBytes),
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['decrypt']
+    );
+  } catch {
+    throw new ModeBDecryptError('INVALID_KEY', 'Unable to import decryption key.');
+  }
+
+  let decryptedBuffer: ArrayBuffer;
+  try {
+    decryptedBuffer = await subtle.decrypt(
       {
         name: 'AES-GCM',
-        iv: toArrayBuffer(iv),
-        additionalData: toArrayBuffer(encoder.encode(greetingId)),
+        iv: toArrayBuffer(ivBytes),
+        additionalData: toArrayBuffer(encoder.encode(envelope.cardId)),
       },
-      aesKey,
-      toArrayBuffer(ciphertext)
+      cryptoKey,
+      toArrayBuffer(ciphertextBytes)
     );
-    return JSON.parse(decoder.decode(decryptedBuffer)) as SealedGreetingPayload;
   } catch {
-    return null;
+    throw new ModeBDecryptError(
+      'INVALID_KEY',
+      'Unable to decrypt this private card. The link key is incorrect or the encrypted card was altered.'
+    );
   }
+
+  try {
+    const parsed = JSON.parse(decoder.decode(decryptedBuffer)) as ModeBPlaintextBundle;
+    if (!parsed || typeof parsed !== 'object' || !parsed.greeting?.id) {
+      throw new Error('Missing greeting structure');
+    }
+    return parsed;
+  } catch {
+    throw new ModeBDecryptError(
+      'CORRUPTED_DOCUMENT',
+      'Decrypted payload is corrupted and cannot be read.'
+    );
+  }
+}
+
+/**
+ * Extracts `#key=...` strictly from URL fragment (`window.location.hash`).
+ * Example fragment: `#/view/ks_abc123#key=4f9d...` -> `{ routeHash: '#/view/ks_abc123', key: '4f9d...' }`
+ */
+export function parseFragmentAndKey(rawHash: string): {
+  routeHash: string;
+  encryptionKey: string | null;
+} {
+  const hash = rawHash || '';
+  const keyMatch = hash.match(/#key=([^&#]+)/);
+  const encryptionKey = keyMatch?.[1] ? decodeURIComponent(keyMatch[1]) : null;
+  const routeHash = hash.replace(/#key=[^&#]*/g, '').replace(/&key=[^&#]*/g, '');
+  return { routeHash, encryptionKey };
 }

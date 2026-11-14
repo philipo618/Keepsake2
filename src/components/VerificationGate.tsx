@@ -1,13 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, Delete, Lock, RotateCcw, ShieldAlert } from 'lucide-react';
+import { CheckCircle2, Delete, Lock, RotateCcw } from 'lucide-react';
 import { triggerConfettiCelebration } from './AnimationCanvas';
 import { audioEngine } from '../lib/audioEngine';
-import { type EncryptedGreetingVault } from '../lib/cryptoVault';
-import {
-  fetchGreetingVault,
-  unlockGreetingVault,
-  verifyGreetingVaultStep,
-} from '../lib/firestoreService';
+import { normalizeVerificationAnswer } from '../lib/cryptoVault';
 import type {
   CustomQuestionPrompt,
   Greeting,
@@ -25,33 +20,21 @@ type VerificationStage =
   | { kind: 'year' }
   | { kind: 'custom'; question: CustomQuestionPrompt };
 
-export interface UnlockedGreetingPayload {
-  mainMessage?: string;
-  additionalMessages?: string[];
-  cardDate?: string;
-  signature?: string;
-  photos?: Greeting['photos'];
-  exportedVideo?: Greeting['exportedVideo'];
-}
-
-function normalizeAnswer(val: unknown): string {
-  return String(val ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ');
-}
-
 export function VerificationGate({
   greeting,
-  previewMode = false,
+  secrets,
   previewSecrets,
+  previewMode = false,
   onVerified,
 }: {
   greeting: Greeting;
-  previewMode?: boolean;
+  secrets?: VerificationSecretsInput;
   previewSecrets?: VerificationSecretsInput;
-  onVerified: (unlockedPayload?: UnlockedGreetingPayload) => void;
+  previewMode?: boolean;
+  onVerified: () => void;
 }) {
+  const effectiveSecrets = secrets || previewSecrets || { customAnswers: [] };
+
   const [stageIndex, setStageIndex] = useState(0);
   const [celebratingMsg, setCelebratingMsg] = useState<string | null>(null);
   const [dayInput, setDayInput] = useState('');
@@ -61,15 +44,12 @@ export function VerificationGate({
   const [checking, setChecking] = useState(false);
   const [stepFeedback, setStepFeedback] = useState<string | null>(null);
   const [lockedOut, setLockedOut] = useState(false);
-  const [previewAttempts, setPreviewAttempts] = useState(0);
-  const [vault, setVault] = useState<EncryptedGreetingVault | null>(null);
-  const [vaultLoading, setVaultLoading] = useState(!previewMode);
-  const [vaultUnavailable, setVaultUnavailable] = useState(false);
+  const [attemptCount, setAttemptCount] = useState(0);
 
   const attemptStorageKey = `keepsake_gate_attempts_${greeting.id}`;
 
   const readAttemptState = (): { count: number; lockedUntil: number } => {
-    if (typeof window === 'undefined') return { count: 0, lockedUntil: 0 };
+    if (typeof window === 'undefined' || previewMode) return { count: 0, lockedUntil: 0 };
     try {
       const raw = localStorage.getItem(attemptStorageKey);
       if (!raw) return { count: 0, lockedUntil: 0 };
@@ -84,7 +64,7 @@ export function VerificationGate({
   };
 
   const writeAttemptState = (state: { count: number; lockedUntil: number }) => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || previewMode) return;
     try {
       localStorage.setItem(attemptStorageKey, JSON.stringify(state));
     } catch {
@@ -93,41 +73,13 @@ export function VerificationGate({
   };
 
   useEffect(() => {
-    if (previewMode) {
-      setVaultLoading(false);
-      setVaultUnavailable(false);
-      return;
-    }
-
+    if (previewMode) return;
     const existingAttempts = readAttemptState();
     if (existingAttempts.lockedUntil > Date.now()) {
       setLockedOut(true);
       const waitSec = Math.ceil((existingAttempts.lockedUntil - Date.now()) / 1000);
       setStepFeedback(`Too many attempts. Please try again in ${waitSec} seconds.`);
     }
-
-    let active = true;
-    setVaultLoading(true);
-    setVaultUnavailable(false);
-    fetchGreetingVault(greeting.id)
-      .then((loadedVault) => {
-        if (!active) return;
-        if (!loadedVault) {
-          setVaultUnavailable(true);
-          return;
-        }
-        setVault(loadedVault);
-      })
-      .catch(() => {
-        if (active) setVaultUnavailable(true);
-      })
-      .finally(() => {
-        if (active) setVaultLoading(false);
-      });
-
-    return () => {
-      active = false;
-    };
   }, [greeting.id, previewMode]);
 
   const stages = useMemo<VerificationStage[]>(() => {
@@ -155,51 +107,76 @@ export function VerificationGate({
     setCustomAnswers({});
     setStepFeedback(null);
     setLockedOut(false);
-    setPreviewAttempts(0);
+    setAttemptCount(0);
   };
 
-  // Protected local draft validator used ONLY for unpublished/draft Creator Preview
-  const runPreviewStepCheck = (payload: {
+  const runStepCheck = (payload: {
     step: 'day' | 'month' | 'year' | 'custom';
     value: unknown;
     questionId?: string;
   }): { valid: boolean; locked?: boolean; remainingAttempts?: number; message?: string } => {
-    const s = previewSecrets || { customAnswers: [] };
-    let valid = false;
-
-    if (payload.step === 'day') {
-      valid = Boolean(s.birthDay) && Number(payload.value) === Number(s.birthDay);
-    } else if (payload.step === 'month') {
-      valid = Boolean(s.birthMonth) && Number(payload.value) === Number(s.birthMonth);
-    } else if (payload.step === 'year') {
-      valid = Boolean(s.birthYear) && Number(payload.value) === Number(s.birthYear);
-    } else if (payload.step === 'custom' && payload.questionId) {
-      const target = s.customAnswers.find((a) => a.id === payload.questionId);
-      if (target && target.answer.trim()) {
-        valid = normalizeAnswer(payload.value) === normalizeAnswer(target.answer);
-      }
-    }
-
-    if (!valid) {
-      const nextCount = previewAttempts + 1;
-      const maxRetries = greeting.verificationMeta.maxRetries ?? 5;
-      const unlimited = maxRetries === 0;
-      if (!unlimited && nextCount >= maxRetries) {
-        setPreviewAttempts(0);
+    if (!previewMode) {
+      const tracker = readAttemptState();
+      if (tracker.lockedUntil > Date.now()) {
+        const waitSec = Math.ceil((tracker.lockedUntil - Date.now()) / 1000);
         return {
           valid: false,
           locked: true,
           remainingAttempts: 0,
-          message: 'Maximum tries reached in preview. Tap Restart Gate or wait 60 seconds.',
+          message: `Too many attempts. Please try again in ${waitSec} seconds.`,
         };
       }
-      setPreviewAttempts(nextCount);
+    }
+
+    let valid = false;
+    if (payload.step === 'day') {
+      valid = Boolean(effectiveSecrets.birthDay) && Number(payload.value) === Number(effectiveSecrets.birthDay);
+    } else if (payload.step === 'month') {
+      valid = Boolean(effectiveSecrets.birthMonth) && Number(payload.value) === Number(effectiveSecrets.birthMonth);
+    } else if (payload.step === 'year') {
+      valid = Boolean(effectiveSecrets.birthYear) && Number(payload.value) === Number(effectiveSecrets.birthYear);
+    } else if (payload.step === 'custom' && payload.questionId) {
+      const target = effectiveSecrets.customAnswers.find((a) => a.id === payload.questionId);
+      if (target && target.answer.trim()) {
+        valid = normalizeVerificationAnswer(payload.value) === normalizeVerificationAnswer(target.answer);
+      }
+    }
+
+    if (!valid) {
+      const maxRetries = greeting.verificationMeta.maxRetries ?? 5;
+      const unlimited = maxRetries === 0;
+      const priorCount = previewMode ? attemptCount : readAttemptState().count;
+      const nextCount = priorCount + 1;
+
+      if (!unlimited && nextCount >= maxRetries) {
+        if (previewMode) {
+          setAttemptCount(0);
+          return {
+            valid: false,
+            locked: true,
+            remainingAttempts: 0,
+            message: 'Maximum tries reached in preview. Tap Reset Gate to test again.',
+          };
+        }
+        writeAttemptState({ count: 0, lockedUntil: Date.now() + 60 * 1000 });
+        return {
+          valid: false,
+          locked: true,
+          remainingAttempts: 0,
+          message: 'Maximum tries reached. Please wait 60 seconds and try again.',
+        };
+      }
+
+      if (previewMode) setAttemptCount(nextCount);
+      else writeAttemptState({ count: nextCount, lockedUntil: 0 });
+
+      const remaining = unlimited ? 99 : Math.max(0, maxRetries - nextCount);
       return {
         valid: false,
         locked: false,
-        remainingAttempts: unlimited ? 99 : Math.max(0, maxRetries - nextCount),
+        remainingAttempts: remaining,
         message: `${greeting.verificationMeta.friendlyErrorMessage || 'That answer does not quite match.'}${
-          !unlimited ? ` (${Math.max(0, maxRetries - nextCount)} tries left)` : ''
+          !unlimited ? ` (${remaining} tries left)` : ''
         }`,
       };
     }
@@ -207,49 +184,27 @@ export function VerificationGate({
     return { valid: true, locked: false };
   };
 
-  const runPreviewFullVerify = (submitted: {
+  const verifyAllStages = (submitted: {
     birthDay?: number;
     birthMonth?: number;
     birthYear?: number;
     customAnswers?: Record<string, string>;
-  }): { verified: boolean; locked?: boolean; message?: string; unlockedPayload?: UnlockedGreetingPayload } => {
-    const s = previewSecrets || { customAnswers: [] };
+  }): boolean => {
     const v = greeting.verificationMeta;
-    let allValid = true;
-
-    if (v.enableBirthdayDay && Number(submitted.birthDay) !== Number(s.birthDay)) allValid = false;
-    if (v.enableBirthdayMonth && Number(submitted.birthMonth) !== Number(s.birthMonth)) allValid = false;
-    if (v.enableBirthdayYear && Number(submitted.birthYear) !== Number(s.birthYear)) allValid = false;
+    if (v.enableBirthdayDay && Number(submitted.birthDay) !== Number(effectiveSecrets.birthDay)) return false;
+    if (v.enableBirthdayMonth && Number(submitted.birthMonth) !== Number(effectiveSecrets.birthMonth)) return false;
+    if (v.enableBirthdayYear && Number(submitted.birthYear) !== Number(effectiveSecrets.birthYear)) return false;
     for (const q of v.customQuestions.filter((c) => c.enabled)) {
-      const expected = s.customAnswers.find((a) => a.id === q.id)?.answer ?? '';
+      const expected = effectiveSecrets.customAnswers.find((a) => a.id === q.id)?.answer ?? '';
       const candidate = submitted.customAnswers?.[q.id] ?? '';
-      if (!expected.trim() || normalizeAnswer(candidate) !== normalizeAnswer(expected)) {
-        allValid = false;
-        break;
+      if (!expected.trim() || normalizeVerificationAnswer(candidate) !== normalizeVerificationAnswer(expected)) {
+        return false;
       }
     }
-
-    if (!allValid) {
-      return {
-        verified: false,
-        message: greeting.verificationMeta.friendlyErrorMessage || 'One or more answers did not match.',
-      };
-    }
-
-    return {
-      verified: true,
-      unlockedPayload: {
-        mainMessage: greeting.mainMessage,
-        additionalMessages: greeting.additionalMessages,
-        cardDate: greeting.cardDate,
-        signature: greeting.signature,
-        photos: greeting.photos,
-        exportedVideo: greeting.exportedVideo,
-      },
-    };
+    return true;
   };
 
-  const advanceOrUnlock = async (overrideCustom?: Record<string, string>, overrideMonth?: number) => {
+  const advanceOrUnlock = (overrideCustom?: Record<string, string>, overrideMonth?: number) => {
     const isLast = stageIndex >= stages.length - 1;
 
     if (!isLast) {
@@ -260,7 +215,7 @@ export function VerificationGate({
         window.setTimeout(() => {
           setCelebratingMsg(null);
           setStageIndex((i) => i + 1);
-        }, 1150);
+        }, 900);
       } else if (currentStage?.kind === 'year') {
         setCelebratingMsg('Wonderful! Birth year confirmed.');
         audioEngine.playSfx('success');
@@ -268,7 +223,7 @@ export function VerificationGate({
         window.setTimeout(() => {
           setCelebratingMsg(null);
           setStageIndex((i) => i + 1);
-        }, 1150);
+        }, 900);
       } else {
         audioEngine.playSfx('success');
         setStageIndex((i) => i + 1);
@@ -276,102 +231,33 @@ export function VerificationGate({
       return;
     }
 
-    const payload = {
+    const ok = verifyAllStages({
       birthDay: dayInput ? Number(dayInput) : undefined,
       birthMonth: overrideMonth ?? selectedMonth ?? undefined,
       birthYear: yearInput ? Number(yearInput) : undefined,
       customAnswers: overrideCustom ?? customAnswers,
-    };
+    });
 
-    let unlockedPayload: UnlockedGreetingPayload | undefined;
-    if (previewMode) {
-      const result = runPreviewFullVerify(payload);
-      if (!result.verified) {
-        audioEngine.playSfx('error');
-        setLockedOut(Boolean(result.locked));
-        setStepFeedback(
-          result.message ||
-            greeting.verificationMeta.friendlyErrorMessage ||
-            'That answer does not match. Please try again.'
-        );
-        return;
-      }
-      unlockedPayload = result.unlockedPayload;
-    } else {
-      if (!vault) {
-        setVaultUnavailable(true);
-        return;
-      }
-      const decrypted = await unlockGreetingVault(vault, greeting, payload);
-      if (!decrypted) {
-        audioEngine.playSfx('error');
-        setStepFeedback(
-          greeting.verificationMeta.friendlyErrorMessage ||
-            'One or more answers did not match. Please try again.'
-        );
-        return;
-      }
-      writeAttemptState({ count: 0, lockedUntil: 0 });
-      unlockedPayload = decrypted;
+    if (!ok) {
+      audioEngine.playSfx('error');
+      setStepFeedback(
+        greeting.verificationMeta.friendlyErrorMessage ||
+          'One or more answers did not match. Please try again.'
+      );
+      return;
     }
 
+    writeAttemptState({ count: 0, lockedUntil: 0 });
     audioEngine.playSfx('success');
     triggerConfettiCelebration(greeting.designConfig.accentColor);
     setCelebratingMsg('All answers verified! Unsealing your gift...');
     window.setTimeout(() => {
       setCelebratingMsg(null);
-      onVerified(unlockedPayload);
-    }, 1050);
+      onVerified();
+    }, 950);
   };
 
-  const runLiveStepCheck = async (payload: {
-    step: 'day' | 'month' | 'year' | 'custom';
-    value: unknown;
-    questionId?: string;
-  }): Promise<{ valid: boolean; locked?: boolean; remainingAttempts?: number; message?: string }> => {
-    if (!vault) {
-      throw new Error('Encrypted greeting vault unavailable.');
-    }
-    const tracker = readAttemptState();
-    if (tracker.lockedUntil > Date.now()) {
-      const waitSec = Math.ceil((tracker.lockedUntil - Date.now()) / 1000);
-      return {
-        valid: false,
-        locked: true,
-        remainingAttempts: 0,
-        message: `Too many attempts. Please try again in ${waitSec} seconds.`,
-      };
-    }
-
-    const valid = await verifyGreetingVaultStep(vault, payload);
-    if (!valid) {
-      const nextCount = tracker.count + 1;
-      const maxRetries = vault.maxRetries ?? greeting.verificationMeta.maxRetries ?? 5;
-      const unlimited = maxRetries === 0;
-      if (!unlimited && nextCount >= maxRetries) {
-        writeAttemptState({ count: 0, lockedUntil: Date.now() + 60 * 1000 });
-        return {
-          valid: false,
-          locked: true,
-          remainingAttempts: 0,
-          message: 'Maximum tries reached. Please wait 60 seconds and try again.',
-        };
-      }
-      writeAttemptState({ count: nextCount, lockedUntil: 0 });
-      return {
-        valid: false,
-        locked: false,
-        remainingAttempts: unlimited ? 99 : Math.max(0, maxRetries - nextCount),
-        message: `${greeting.verificationMeta.friendlyErrorMessage || 'That answer does not quite match.'}${
-          !unlimited ? ` (${Math.max(0, maxRetries - nextCount)} tries left)` : ''
-        }`,
-      };
-    }
-
-    return { valid: true, locked: false };
-  };
-
-  const handleCheckDay = async () => {
+  const handleCheckDay = () => {
     const dayNum = Number(dayInput);
     if (!dayNum || dayNum < 1 || dayNum > 31) {
       setStepFeedback('Please enter a valid day between 1 and 31.');
@@ -380,57 +266,39 @@ export function VerificationGate({
     setChecking(true);
     setStepFeedback(null);
     try {
-      const res = previewMode
-        ? runPreviewStepCheck({ step: 'day', value: dayNum })
-        : await runLiveStepCheck({ step: 'day', value: dayNum });
+      const res = runStepCheck({ step: 'day', value: dayNum });
       if (!res.valid) {
         audioEngine.playSfx('error');
         setLockedOut(Boolean(res.locked));
-        setStepFeedback(
-          res.message ||
-            `${greeting.verificationMeta.friendlyErrorMessage}${
-              typeof res.remainingAttempts === 'number' ? ` (${res.remainingAttempts} tries left)` : ''
-            }`
-        );
+        setStepFeedback(res.message || greeting.verificationMeta.friendlyErrorMessage);
         return;
       }
-      await advanceOrUnlock();
-    } catch {
-      setStepFeedback('Unable to verify answer right now. Please try again.');
+      advanceOrUnlock();
     } finally {
       setChecking(false);
     }
   };
 
-  const handleCheckMonth = async (monthNum: number) => {
+  const handleCheckMonth = (monthNum: number) => {
     if (checking || lockedOut) return;
     setSelectedMonth(monthNum);
     setChecking(true);
     setStepFeedback(null);
     try {
-      const res = previewMode
-        ? runPreviewStepCheck({ step: 'month', value: monthNum })
-        : await runLiveStepCheck({ step: 'month', value: monthNum });
+      const res = runStepCheck({ step: 'month', value: monthNum });
       if (!res.valid) {
         audioEngine.playSfx('error');
         setLockedOut(Boolean(res.locked));
-        setStepFeedback(
-          res.message ||
-            `${greeting.verificationMeta.friendlyErrorMessage}${
-              typeof res.remainingAttempts === 'number' ? ` (${res.remainingAttempts} tries left)` : ''
-            }`
-        );
+        setStepFeedback(res.message || greeting.verificationMeta.friendlyErrorMessage);
         return;
       }
-      await advanceOrUnlock(undefined, monthNum);
-    } catch {
-      setStepFeedback('Unable to verify month right now.');
+      advanceOrUnlock(undefined, monthNum);
     } finally {
       setChecking(false);
     }
   };
 
-  const handleCheckYear = async () => {
+  const handleCheckYear = () => {
     const yr = Number(yearInput);
     if (!yr || yr < 1900 || yr > 2100) {
       setStepFeedback('Please enter a valid 4-digit year.');
@@ -439,29 +307,20 @@ export function VerificationGate({
     setChecking(true);
     setStepFeedback(null);
     try {
-      const res = previewMode
-        ? runPreviewStepCheck({ step: 'year', value: yr })
-        : await runLiveStepCheck({ step: 'year', value: yr });
+      const res = runStepCheck({ step: 'year', value: yr });
       if (!res.valid) {
         audioEngine.playSfx('error');
         setLockedOut(Boolean(res.locked));
-        setStepFeedback(
-          res.message ||
-            `${greeting.verificationMeta.friendlyErrorMessage}${
-              typeof res.remainingAttempts === 'number' ? ` (${res.remainingAttempts} tries left)` : ''
-            }`
-        );
+        setStepFeedback(res.message || greeting.verificationMeta.friendlyErrorMessage);
         return;
       }
-      await advanceOrUnlock();
-    } catch {
-      setStepFeedback('Unable to verify year right now.');
+      advanceOrUnlock();
     } finally {
       setChecking(false);
     }
   };
 
-  const handleCheckCustom = async (q: CustomQuestionPrompt) => {
+  const handleCheckCustom = (q: CustomQuestionPrompt) => {
     const ans = customAnswers[q.id] || '';
     if (!ans.trim()) {
       setStepFeedback('Please enter your answer before continuing.');
@@ -470,27 +329,14 @@ export function VerificationGate({
     setChecking(true);
     setStepFeedback(null);
     try {
-      const res = previewMode
-        ? runPreviewStepCheck({ step: 'custom', questionId: q.id, value: ans })
-        : await runLiveStepCheck({
-            step: 'custom',
-            questionId: q.id,
-            value: ans,
-          });
+      const res = runStepCheck({ step: 'custom', questionId: q.id, value: ans });
       if (!res.valid) {
         audioEngine.playSfx('error');
         setLockedOut(Boolean(res.locked));
-        setStepFeedback(
-          res.message ||
-            `${greeting.verificationMeta.friendlyErrorMessage}${
-              typeof res.remainingAttempts === 'number' ? ` (${res.remainingAttempts} tries left)` : ''
-            }`
-        );
+        setStepFeedback(res.message || greeting.verificationMeta.friendlyErrorMessage);
         return;
       }
-      await advanceOrUnlock();
-    } catch {
-      setStepFeedback('Unable to verify answer right now.');
+      advanceOrUnlock();
     } finally {
       setChecking(false);
     }
@@ -500,7 +346,7 @@ export function VerificationGate({
     <div className="w-full max-w-md mx-auto rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-6 sm:p-8 shadow-xl space-y-6">
       {previewMode && (
         <div className="rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/80 dark:bg-amber-950/30 px-3 py-2 flex items-center justify-between gap-2 text-xs text-amber-900 dark:text-amber-200">
-          <span className="font-medium">Creator Preview · Mode B Active</span>
+          <span className="font-medium">Creator Preview · Mode B Quiz</span>
           <button
             type="button"
             onClick={handleRestartPreviewGate}
@@ -524,22 +370,7 @@ export function VerificationGate({
         )}
       </div>
 
-      {vaultLoading ? (
-        <div className="py-10 text-center space-y-2 text-xs text-slate-500 dark:text-slate-400">
-          <Lock className="w-6 h-6 mx-auto animate-pulse text-rose-700 dark:text-rose-400" />
-          <p>Preparing encrypted gift verification...</p>
-        </div>
-      ) : vaultUnavailable ? (
-        <div className="py-6 text-center space-y-3">
-          <ShieldAlert className="w-10 h-10 text-amber-600 dark:text-amber-400 mx-auto" />
-          <h2 className="font-display text-xl font-semibold text-slate-900 dark:text-white">
-            Verification Vault Not Ready
-          </h2>
-          <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-            This greeting&apos;s encrypted verification vault could not be loaded. Ask the creator to re-publish the card in Mode B.
-          </p>
-        </div>
-      ) : celebratingMsg ? (
+      {celebratingMsg ? (
         <div className="py-12 text-center space-y-3 animate-reveal-up">
           <CheckCircle2 className="w-12 h-12 text-emerald-600 mx-auto" />
           <p className="font-display text-2xl font-semibold text-slate-900 dark:text-white">
@@ -549,25 +380,21 @@ export function VerificationGate({
       ) : stages.length === 0 ? (
         <div className="text-center space-y-4 py-4">
           <p className="text-sm text-slate-600 dark:text-slate-300">
-            {previewMode
-              ? 'Interactive Access is enabled, but no verification screens are currently checked. Turn on Birthday Day, Month, Year, or a Personal Question in Step 8 to test the gate.'
-              : 'No verification steps configured. Ready to unseal your gift!'}
+            Your private greeting card has been decrypted with your link key!
           </p>
-          {!previewMode && (
-            <button
-              type="button"
-              onClick={() => advanceOrUnlock()}
-              className="w-full min-h-[48px] rounded-xl bg-rose-700 text-white text-sm font-medium"
-            >
-              Open Gift
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => onVerified()}
+            className="w-full min-h-[48px] rounded-xl bg-rose-700 text-white text-sm font-medium"
+          >
+            Open Gift
+          </button>
         </div>
       ) : currentStage?.kind === 'day' ? (
         <div className="space-y-5 text-center">
           <div className="space-y-2">
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Before opening your special gift, let&apos;s see how well you know your birthday!
+              Before opening your special gift, let&apos;s confirm your birthday!
             </p>
             <h2 className="font-display text-2xl font-semibold text-slate-900 dark:text-white">
               What day were you born?

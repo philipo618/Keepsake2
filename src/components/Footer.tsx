@@ -3,7 +3,7 @@ import { useApp } from './AppContext';
 import type { AppRoute } from './Navbar';
 
 export function Footer({ navigate }: { navigate: (next: AppRoute) => void }) {
-  const { theme, toggleTheme, settings, user, logout } = useApp();
+  const { theme, toggleTheme, settings } = useApp();
 
   return (
     <footer className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0B0F17]">
@@ -45,7 +45,7 @@ export function Footer({ navigate }: { navigate: (next: AppRoute) => void }) {
               onClick={() => navigate({ page: 'admin' })}
               className="hover:text-slate-900 dark:hover:text-white min-h-[40px] px-2"
             >
-              Admin
+              Studio Settings
             </button>
 
             <button
@@ -66,22 +66,14 @@ export function Footer({ navigate }: { navigate: (next: AppRoute) => void }) {
                 </>
               )}
             </button>
-
-            {user && (
-              <button
-                type="button"
-                onClick={logout}
-                className="min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-medium text-slate-500 hover:text-rose-700 dark:hover:text-rose-400"
-              >
-                Sign Out
-              </button>
-            )}
           </div>
         </div>
 
         <div className="mt-8 pt-6 border-t border-slate-100 dark:border-slate-800/80 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-          <span>© {new Date().getFullYear()} {settings.siteName || 'Keepsake'}. All rights reserved.</span>
-          <span>Powered by Firebase &amp; Static Web Architecture</span>
+          <span>
+            © {new Date().getFullYear()} {settings.siteName || 'Keepsake'}. All rights reserved.
+          </span>
+          <span>Static Web Architecture · Cloudinary Media &amp; Client-Side AES-256-GCM</span>
         </div>
       </div>
     </footer>

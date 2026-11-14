@@ -220,6 +220,7 @@ export function GreetingExperience({
     keySuffix = ''
   ) => {
     const isBroken = brokenImages[photo.id];
+    const isVideo = photo.mediaType === 'video';
     const txClass = getTransitionClass(photo);
     const txStyle = {
       ['--photo-tx-duration' as string]: `${transitionDurationMs}ms`,
@@ -232,36 +233,58 @@ export function GreetingExperience({
           className={`overflow-hidden rounded-xl border border-black/10 dark:border-white/10 bg-white/10 backdrop-blur-sm ${txClass} ${extraClass}`}
           style={txStyle}
         >
-          <div className="relative aspect-[4/3] w-full overflow-hidden bg-slate-200/40 dark:bg-slate-800/40">
-            {underlayPhoto && underlayPhoto.id !== photo.id && underlayPhoto.url && !brokenImages[underlayPhoto.id] && (
-              <img
-                src={underlayPhoto.url}
-                alt=""
-                aria-hidden="true"
-                referrerPolicy="no-referrer"
-                className="absolute inset-0 w-full h-full object-cover opacity-35 pointer-events-none"
-                style={{
-                  objectPosition: `${underlayPhoto.cropPosition?.x ?? 50}% ${underlayPhoto.cropPosition?.y ?? 50}%`,
-                }}
-              />
-            )}
+          <div className="relative aspect-[4/3] w-full overflow-hidden bg-slate-900/40">
+            {!isVideo &&
+              underlayPhoto &&
+              underlayPhoto.mediaType !== 'video' &&
+              underlayPhoto.id !== photo.id &&
+              underlayPhoto.url &&
+              !brokenImages[underlayPhoto.id] && (
+                <img
+                  src={underlayPhoto.url}
+                  alt=""
+                  aria-hidden="true"
+                  referrerPolicy="no-referrer"
+                  className="absolute inset-0 w-full h-full object-cover opacity-35 pointer-events-none"
+                  style={{
+                    objectPosition: `${underlayPhoto.cropPosition?.x ?? 50}% ${underlayPhoto.cropPosition?.y ?? 50}%`,
+                  }}
+                />
+              )}
             {!isBroken && photo.url ? (
-              <img
-                src={photo.url}
-                alt={photo.caption || `Memory ${idx + 1}`}
-                referrerPolicy="no-referrer"
-                loading="lazy"
-                onError={() => setBrokenImages((prev) => ({ ...prev, [photo.id]: true }))}
-                className="relative z-10 w-full h-full object-cover"
-                style={{
-                  objectPosition: `${photo.cropPosition?.x ?? 50}% ${photo.cropPosition?.y ?? 50}%`,
-                  transform: `scale(${photo.cropPosition?.zoom ?? 1})`,
-                }}
-              />
+              isVideo ? (
+                <video
+                  controls
+                  playsInline
+                  preload="metadata"
+                  src={photo.url}
+                  onPlay={() => {
+                    if (musicPlaying) {
+                      audioEngine.stop();
+                      setMusicPlaying(false);
+                    }
+                  }}
+                  onError={() => setBrokenImages((prev) => ({ ...prev, [photo.id]: true }))}
+                  className="relative z-10 w-full h-full object-cover bg-black"
+                />
+              ) : (
+                <img
+                  src={photo.url}
+                  alt={photo.caption || `Memory ${idx + 1}`}
+                  referrerPolicy="no-referrer"
+                  loading="lazy"
+                  onError={() => setBrokenImages((prev) => ({ ...prev, [photo.id]: true }))}
+                  className="relative z-10 w-full h-full object-cover"
+                  style={{
+                    objectPosition: `${photo.cropPosition?.x ?? 50}% ${photo.cropPosition?.y ?? 50}%`,
+                    transform: `scale(${photo.cropPosition?.zoom ?? 1})`,
+                  }}
+                />
+              )
             ) : (
               <div className="relative z-10 w-full h-full flex flex-col items-center justify-center p-4 text-center opacity-70">
                 <ImageIcon className="w-8 h-8 mb-2" />
-                <span className="text-xs">{photo.caption || 'Memory Photo'}</span>
+                <span className="text-xs">{photo.caption || 'Memory Media'}</span>
               </div>
             )}
           </div>
@@ -648,27 +671,45 @@ export function GreetingExperience({
           <div className="w-full max-w-4xl mx-auto space-y-6 text-center photo-tx-stage">
             <div
               key={`fs-${activeFullscreenPhoto.id}-${slideIndex}`}
-              className={`relative aspect-[16/10] w-full rounded-2xl overflow-hidden shadow-2xl border border-white/15 ${activeFullscreenTxClass}`}
+              className={`relative aspect-[16/10] w-full rounded-2xl overflow-hidden shadow-2xl border border-white/15 bg-black ${activeFullscreenTxClass}`}
               style={{ ['--photo-tx-duration' as string]: `${transitionDurationMs}ms` }}
             >
-              <img
-                src={activeFullscreenPhoto.url}
-                alt={activeFullscreenPhoto.caption || greeting.title}
-                referrerPolicy="no-referrer"
-                className="w-full h-full object-cover"
-                style={{
-                  objectPosition: `${activeFullscreenPhoto.cropPosition?.x ?? 50}% ${activeFullscreenPhoto.cropPosition?.y ?? 50}%`,
-                  transform: `scale(${activeFullscreenPhoto.cropPosition?.zoom ?? 1})`,
-                }}
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/25 to-transparent flex flex-col justify-end p-6 sm:p-8 text-left text-white">
-                <h2 className={`${fontClass} text-2xl sm:text-4xl font-semibold`}>
-                  {greeting.title}
-                </h2>
-                <p className="mt-2 text-sm sm:text-base text-white/90 max-w-2xl line-clamp-3">
-                  {activeFullscreenPhoto.caption || greeting.mainMessage}
-                </p>
-              </div>
+              {activeFullscreenPhoto.mediaType === 'video' ? (
+                <video
+                  controls
+                  playsInline
+                  preload="metadata"
+                  src={activeFullscreenPhoto.url}
+                  onPlay={() => {
+                    if (musicPlaying) {
+                      audioEngine.stop();
+                      setMusicPlaying(false);
+                    }
+                  }}
+                  className="w-full h-full object-contain bg-black"
+                />
+              ) : (
+                <>
+                  <img
+                    src={activeFullscreenPhoto.url}
+                    alt={activeFullscreenPhoto.caption || greeting.title}
+                    referrerPolicy="no-referrer"
+                    className="w-full h-full object-cover"
+                    style={{
+                      objectPosition: `${activeFullscreenPhoto.cropPosition?.x ?? 50}% ${activeFullscreenPhoto.cropPosition?.y ?? 50}%`,
+                      transform: `scale(${activeFullscreenPhoto.cropPosition?.zoom ?? 1})`,
+                    }}
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/25 to-transparent flex flex-col justify-end p-6 sm:p-8 text-left text-white pointer-events-none">
+                    <h2 className={`${fontClass} text-2xl sm:text-4xl font-semibold`}>
+                      {greeting.title}
+                    </h2>
+                    <p className="mt-2 text-sm sm:text-base text-white/90 max-w-2xl line-clamp-3">
+                      {activeFullscreenPhoto.caption || greeting.mainMessage}
+                    </p>
+                  </div>
+                </>
+              )}
             </div>
 
             <div className="flex items-center justify-center gap-4">

@@ -276,22 +276,99 @@ function drawImageDownscaledCanvas(img: HTMLImageElement, maxDimension: number):
   return c;
 }
 
+async function extractVideoPosterCanvas(url: string, maxDimension: number): Promise<HTMLCanvasElement> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.crossOrigin = 'anonymous';
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('Video frame extraction timed out'));
+    }, 6000);
+
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    };
+
+    video.onloadeddata = () => {
+      try {
+        const targetTime = video.duration && Number.isFinite(video.duration) ? Math.min(0.5, video.duration * 0.25) : 0;
+        if (targetTime > 0 && video.readyState >= 2) {
+          video.currentTime = targetTime;
+        } else {
+          drawFrame();
+        }
+      } catch {
+        drawFrame();
+      }
+    };
+
+    const drawFrame = () => {
+      try {
+        let w = video.videoWidth || 800;
+        let h = video.videoHeight || 600;
+        if (w > maxDimension || h > maxDimension) {
+          const ratio = Math.min(maxDimension / w, maxDimension / h);
+          w = Math.max(2, Math.round(w * ratio));
+          h = Math.max(2, Math.round(h * ratio));
+        }
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, w, h);
+          ctx.getImageData(0, 0, 1, 1);
+        }
+        cleanup();
+        resolve(c);
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    };
+
+    video.onseeked = drawFrame;
+    video.onerror = () => {
+      cleanup();
+      reject(new Error(`Failed to load video poster from ${url}`));
+    };
+    video.src = url;
+  });
+}
+
 export async function loadVideoImageCache(
   greeting: Greeting,
   maxDimension: number
 ): Promise<LoadedImageCache> {
   const images = new Map<string, HTMLCanvasElement>();
   const warnings: string[] = [];
-  const urls = new Set<string>();
+  const entries = new Map<string, 'image' | 'video'>();
   for (const p of greeting.photos || []) {
-    if (p.url) urls.add(p.url);
+    if (p.url) entries.set(p.url, p.mediaType === 'video' ? 'video' : 'image');
   }
   if (greeting.designConfig.backgroundType === 'image' && greeting.designConfig.backgroundImageUrl) {
-    urls.add(greeting.designConfig.backgroundImageUrl);
+    entries.set(greeting.designConfig.backgroundImageUrl, 'image');
   }
 
   await Promise.all(
-    Array.from(urls).map(async (url) => {
+    Array.from(entries.entries()).map(async ([url, mediaKind]) => {
+      if (mediaKind === 'video') {
+        try {
+          const poster = await extractVideoPosterCanvas(url, maxDimension);
+          images.set(url, poster);
+        } catch {
+          warnings.push('One embedded video clip uses a styled frame placeholder in slideshow export.');
+        }
+        return;
+      }
+
       try {
         const img = await loadBitmapElement(url);
         const downscaled = drawImageDownscaledCanvas(img, maxDimension);

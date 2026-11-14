@@ -1,10 +1,31 @@
-import { useState } from 'react';
-import { ArrowUp, ImagePlus, Play, Search, Sparkles, Star, Trash2, Upload } from 'lucide-react';
-import { searchLicensedStockPhotos, uploadMediaFile, type StockPhotoResult } from '../lib/imageUtils';
+import { useRef, useState } from 'react';
+import {
+  AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  Film,
+  ImagePlus,
+  Play,
+  RefreshCw,
+  Search,
+  Sparkles,
+  Star,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react';
 import { STUDIO_ASSETS } from '../lib/assets';
 import { PHOTO_TRANSITIONS, resolvePhotoTransition } from '../lib/catalog';
-import { useApp } from './AppContext';
+import type { UploadProgressInfo } from '../lib/cloudinaryService';
+import { searchLicensedStockPhotos, uploadMediaFile, type StockPhotoResult } from '../lib/imageUtils';
 import type { PhotoItem, PhotoTransitionType } from '../lib/types';
+
+function inferMediaKind(file: File): 'image' | 'video' {
+  if (file.type.startsWith('video/')) return 'video';
+  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+  if (['mp4', 'webm', 'mov', 'm4v'].includes(ext)) return 'video';
+  return 'image';
+}
 
 export function PhotoManagerPanel({
   greetingId,
@@ -29,10 +50,13 @@ export function PhotoManagerPanel({
     slideshowIntervalMs?: number;
   }) => void;
 }) {
-  const { user, promptAuth } = useApp();
   const [sourceTab, setSourceTab] = useState<'upload' | 'stock' | 'studio' | 'url'>('upload');
   const [uploading, setUploading] = useState(false);
+  const [uploadStatusText, setUploadStatusText] = useState('');
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressInfo | null>(null);
   const [uploadError, setUploadError] = useState('');
+  const [failedQueue, setFailedQueue] = useState<File[]>([]);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Stock search state
   const [stockQuery, setStockQuery] = useState('');
@@ -42,6 +66,7 @@ export function PhotoManagerPanel({
 
   // External URL state
   const [externalUrl, setExternalUrl] = useState('');
+  const [externalKind, setExternalKind] = useState<'image' | 'video'>('image');
   const [externalCaption, setExternalCaption] = useState('');
 
   // Crop / Position modal state
@@ -53,38 +78,106 @@ export function PhotoManagerPanel({
 
   const normalizedDefaultTx = resolvePhotoTransition(defaultTransition);
 
-  const handleFileUpload = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    if (!user) {
-      promptAuth('Sign in to upload personal photographs from your device.');
-      return;
-    }
+  const runUploadBatch = async (selectedFiles: File[], replaceTargetId?: string) => {
+    if (selectedFiles.length === 0) return;
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setUploading(true);
     setUploadError('');
-    try {
-      const remaining = Math.max(0, maxPhotos - photos.length);
-      const selectedFiles = Array.from(files).slice(0, remaining);
-      const added: PhotoItem[] = [];
+    setFailedQueue([]);
 
-      for (const file of selectedFiles) {
-        const res = await uploadMediaFile(file, greetingId, 'image');
-        added.push({
-          id: `ph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          url: res.url,
-          caption: file.name.replace(/\.[^.]+$/, '').slice(0, 60),
-          sourceType: 'uploaded',
-          isCover: photos.length === 0 && added.length === 0,
-          cropPosition: { x: 50, y: 50, zoom: 1 },
-          transition: normalizedDefaultTx,
-        });
+    const added: PhotoItem[] = [];
+    const failures: File[] = [];
+    let latestError = '';
+
+    try {
+      for (let i = 0; i < selectedFiles.length; i++) {
+        if (controller.signal.aborted) break;
+        const file = selectedFiles[i];
+        const kind = inferMediaKind(file);
+        setUploadStatusText(
+          `Uploading ${kind} (${i + 1}/${selectedFiles.length}): ${file.name}`
+        );
+        setUploadProgress({ loadedBytes: 0, totalBytes: file.size, percent: 0 });
+
+        try {
+          const res = await uploadMediaFile(file, greetingId, kind, {
+            signal: controller.signal,
+            onProgress: (prog) => setUploadProgress(prog),
+          });
+
+          const newItem: PhotoItem = {
+            id: replaceTargetId || `ph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            url: res.url,
+            mediaType: kind,
+            caption: file.name.replace(/\.[^.]+$/, '').slice(0, 60),
+            sourceType: 'uploaded',
+            cloudinaryPublicId: res.publicId,
+            mimeType: file.type,
+            bytes: res.sizeBytes,
+            durationSec: res.durationSec,
+            localBlobId: res.localBlobId,
+            isCover: !replaceTargetId && photos.length === 0 && added.length === 0,
+            cropPosition: { x: 50, y: 50, zoom: 1 },
+            transition: normalizedDefaultTx,
+          };
+
+          if (replaceTargetId) {
+            onChange(
+              photos.map((p) =>
+                p.id === replaceTargetId ? { ...newItem, isCover: p.isCover } : p
+              )
+            );
+          } else {
+            added.push(newItem);
+          }
+        } catch (err) {
+          if ((err as Error)?.name === 'AbortError') {
+            latestError = 'Upload cancelled.';
+            break;
+          }
+          failures.push(file);
+          latestError = err instanceof Error ? err.message : `Failed to upload ${file.name}.`;
+        }
       }
-      onChange([...photos, ...added]);
-    } catch (err) {
-      setUploadError(err instanceof Error ? err.message : 'Photo upload failed.');
+
+      if (!replaceTargetId && added.length > 0) {
+        onChange([...photos, ...added]);
+      }
+      if (failures.length > 0) {
+        setFailedQueue(failures);
+      }
+      if (latestError) {
+        setUploadError(latestError);
+      }
     } finally {
       setUploading(false);
+      setUploadProgress(null);
+      setUploadStatusText('');
+      abortControllerRef.current = null;
     }
+  };
+
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const remaining = Math.max(0, maxPhotos - photos.length);
+    const selectedFiles = Array.from(files).slice(0, remaining);
+    if (selectedFiles.length === 0) {
+      setUploadError(`Maximum limit of ${maxPhotos} media items reached for this card.`);
+      return;
+    }
+    await runUploadBatch(selectedFiles);
+  };
+
+  const handleReplaceMedia = async (itemId: string, files: FileList | null) => {
+    const file = files?.[0];
+    if (!file) return;
+    await runUploadBatch([file], itemId);
+  };
+
+  const handleCancelUpload = () => {
+    abortControllerRef.current?.abort();
   };
 
   const handleStockSearch = async (e: React.FormEvent) => {
@@ -112,6 +205,7 @@ export function PhotoManagerPanel({
       {
         id: `ph_${Date.now()}_${item.id}`,
         url: item.fullUrl,
+        mediaType: 'image',
         caption: item.title.slice(0, 80),
         sourceType: 'licensed-stock',
         license: item.license,
@@ -130,6 +224,7 @@ export function PhotoManagerPanel({
       {
         id: `ph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         url,
+        mediaType: 'image',
         caption: title,
         sourceType: 'licensed-stock',
         license: 'Keepsake Studio Artwork',
@@ -149,7 +244,8 @@ export function PhotoManagerPanel({
       {
         id: `ph_${Date.now()}_ext`,
         url: clean,
-        caption: externalCaption.trim() || 'Linked Image',
+        mediaType: externalKind,
+        caption: externalCaption.trim() || (externalKind === 'video' ? 'Linked Video' : 'Linked Image'),
         sourceType: 'external-url',
         license: 'External Link (User Provided)',
         isCover: photos.length === 0,
@@ -165,11 +261,12 @@ export function PhotoManagerPanel({
     onChange(photos.map((p) => ({ ...p, isCover: p.id === id })));
   };
 
-  const moveUp = (idx: number) => {
-    if (idx <= 0) return;
+  const moveItem = (idx: number, dir: -1 | 1) => {
+    const target = idx + dir;
+    if (target < 0 || target >= photos.length) return;
     const copy = [...photos];
     const [item] = copy.splice(idx, 1);
-    copy.splice(idx - 1, 0, item);
+    copy.splice(target, 0, item);
     onChange(copy);
   };
 
@@ -193,15 +290,16 @@ export function PhotoManagerPanel({
   };
 
   const editingPhoto = photos.find((p) => p.id === editingPhotoId) || null;
+  const imagePool = photos.filter((p) => p.mediaType !== 'video');
   const previewPool =
-    photos.length > 0
-      ? photos.map((p) => ({ url: p.url, caption: p.caption || 'Selected Photo', tx: resolvePhotoTransition(p.transition) }))
+    imagePool.length > 0
+      ? imagePool.map((p) => ({ url: p.url, caption: p.caption || 'Selected Photo', tx: resolvePhotoTransition(p.transition) }))
       : [
           { url: STUDIO_ASSETS.heroGift, caption: 'Studio Sample · Velvet Keepsake', tx: normalizedDefaultTx },
           { url: STUDIO_ASSETS.floral, caption: 'Studio Sample · Pressed Peonies', tx: normalizedDefaultTx },
         ];
   const currentPreviewSample = previewPool[txPreviewIndex % previewPool.length];
-  const activePreviewTx = photos.length > 0 ? normalizedDefaultTx : currentPreviewSample.tx;
+  const activePreviewTx = imagePool.length > 0 ? normalizedDefaultTx : currentPreviewSample.tx;
 
   return (
     <div className="space-y-6">
@@ -209,7 +307,7 @@ export function PhotoManagerPanel({
       <div className="flex flex-wrap items-center gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
         {(
           [
-            { id: 'upload', label: 'Device Upload' },
+            { id: 'upload', label: 'Upload Photos & Videos' },
             { id: 'stock', label: 'Licensed Stock (Commons)' },
             { id: 'studio', label: 'Studio Artwork' },
             { id: 'url', label: 'External URL' },
@@ -230,30 +328,88 @@ export function PhotoManagerPanel({
         ))}
       </div>
 
-      {/* Upload Panel */}
+      {/* Upload Panel (Cloudinary Unsigned Direct Upload + IndexedDB Draft Backup) */}
       {sourceTab === 'upload' && (
         <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 p-6 text-center space-y-3 bg-slate-50/70 dark:bg-slate-900/40">
           <Upload className="w-7 h-7 mx-auto text-rose-700 dark:text-rose-400" />
           <div>
             <p className="text-sm font-medium text-slate-900 dark:text-white">
-              Upload one or multiple photographs
+              Upload photos or video clips directly to Cloudinary CDN
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Automatically compressed for mobile speed. Up to {maxPhotos} photos per card.
+              Photos (JPEG/PNG/WebP/GIF ≤ 10 MB) &amp; Videos (MP4/WebM/MOV ≤ 100 MB, auto-chunked &gt; 20 MB). Up to {maxPhotos} items per card.
             </p>
           </div>
-          <label className="inline-flex items-center justify-center min-h-[44px] px-5 py-2.5 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium cursor-pointer hover:opacity-90">
-            <span>{uploading ? 'Uploading & Optimizing...' : 'Select Photos from Device'}</span>
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              disabled={uploading || photos.length >= maxPhotos}
-              onChange={(e) => handleFileUpload(e.target.files)}
-              className="hidden"
-            />
-          </label>
-          {uploadError && <p className="text-xs text-rose-600 dark:text-rose-400">{uploadError}</p>}
+
+          {!uploading ? (
+            <label
+              className={`inline-flex items-center justify-center min-h-[44px] px-5 py-2.5 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium hover:opacity-90 ${
+                photos.length >= maxPhotos ? 'opacity-50 pointer-events-none' : 'cursor-pointer'
+              }`}
+            >
+              <span>Select Photos or Videos from Device</span>
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-m4v"
+                multiple
+                disabled={uploading || photos.length >= maxPhotos}
+                onChange={(e) => {
+                  handleFileUpload(e.target.files);
+                  e.target.value = '';
+                }}
+                className="hidden"
+              />
+            </label>
+          ) : (
+            <div className="max-w-md mx-auto rounded-xl border border-rose-200 dark:border-rose-900 bg-white dark:bg-[#131924] p-3.5 text-left space-y-2">
+              <div className="flex items-center justify-between gap-2 text-xs font-medium">
+                <span className="truncate text-slate-900 dark:text-white">{uploadStatusText}</span>
+                <span className="font-mono tabular-nums shrink-0 text-rose-700 dark:text-rose-400">
+                  {uploadProgress?.percent ?? 0}%
+                </span>
+              </div>
+              <div className="h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                <div
+                  className="h-full bg-rose-700 transition-all duration-150"
+                  style={{ width: `${uploadProgress?.percent ?? 0}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-500">
+                <span>
+                  {uploadProgress?.totalChunks
+                    ? `Chunk ${uploadProgress.chunkIndex}/${uploadProgress.totalChunks}`
+                    : 'Uploading directly to Cloudinary...'}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleCancelUpload}
+                  className="inline-flex items-center gap-1 text-rose-600 font-medium hover:underline"
+                >
+                  <X className="w-3 h-3" />
+                  <span>Cancel</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {uploadError && (
+            <div className="max-w-md mx-auto rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50 dark:bg-rose-950/30 p-3 text-xs text-rose-700 dark:text-rose-300 space-y-2 text-left">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{uploadError}</span>
+              </div>
+              {failedQueue.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => runUploadBatch(failedQueue)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-700 text-white font-medium"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Retry Failed Upload ({failedQueue.length})</span>
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -339,15 +495,25 @@ export function PhotoManagerPanel({
       {sourceTab === 'url' && (
         <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-3 bg-white dark:bg-slate-900/50">
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Link an external image URL you have permission to use. It will be clearly marked as an External URL.
+            Link an external image or video URL you have permission to use.
           </p>
-          <input
-            type="url"
-            value={externalUrl}
-            onChange={(e) => setExternalUrl(e.target.value)}
-            placeholder="https://example.com/photo.jpg"
-            className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm outline-none focus:border-rose-600"
-          />
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <input
+              type="url"
+              value={externalUrl}
+              onChange={(e) => setExternalUrl(e.target.value)}
+              placeholder={externalKind === 'video' ? 'https://example.com/clip.mp4' : 'https://example.com/photo.jpg'}
+              className="sm:col-span-2 w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent text-sm outline-none focus:border-rose-600"
+            />
+            <select
+              value={externalKind}
+              onChange={(e) => setExternalKind(e.target.value as 'image' | 'video')}
+              className="min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+            >
+              <option value="image">Image URL</option>
+              <option value="video">Video URL</option>
+            </select>
+          </div>
           <input
             type="text"
             value={externalCaption}
@@ -361,12 +527,12 @@ export function PhotoManagerPanel({
             className="min-h-[44px] px-4 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium flex items-center gap-2"
           >
             <ImagePlus className="w-4 h-4" />
-            <span>Add External Image</span>
+            <span>Add External {externalKind === 'video' ? 'Video' : 'Image'}</span>
           </button>
         </div>
       )}
 
-      {/* Slideshow & 20-Transition Studio Controls */}
+      {/* Slideshow & Transition Studio Controls */}
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/40 p-4 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -434,7 +600,7 @@ export function PhotoManagerPanel({
                     onClick={() => applyDefaultTransitionToAll(normalizedDefaultTx)}
                     className="min-h-[40px] px-3 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-medium shrink-0"
                   >
-                    Apply to All Photos
+                    Apply to All
                   </button>
                 )}
               </div>
@@ -480,126 +646,177 @@ export function PhotoManagerPanel({
         </div>
       </div>
 
-      {/* Selected Photos List */}
+      {/* Selected Media List */}
       <div className="space-y-3">
         <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-          <span>Selected Photos ({photos.length} / {maxPhotos})</span>
-          <span>Assign individual transitions or adjust framing per photo</span>
+          <span>Selected Media ({photos.length} / {maxPhotos})</span>
+          <span>Reorder, caption, replace, or adjust framing per item</span>
         </div>
 
         {photos.length === 0 ? (
           <p className="text-sm text-slate-500 dark:text-slate-400 py-4 text-center border border-slate-200 dark:border-slate-800 rounded-xl">
-            No photos added yet. Upload memories or explore licensed artwork above.
+            No photos or videos added yet. Upload memories or explore licensed artwork above.
           </p>
         ) : (
           <div className="space-y-3">
-            {photos.map((photo, idx) => (
-              <div
-                key={photo.id}
-                className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-3 flex flex-col sm:flex-row gap-3 items-start sm:items-center"
-              >
-                <div className="w-24 h-20 rounded-lg overflow-hidden bg-slate-100 dark:bg-slate-800 shrink-0">
-                  <img
-                    src={photo.url}
-                    alt={photo.caption || 'Selected photo'}
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover"
-                    style={{
-                      objectPosition: `${photo.cropPosition.x}% ${photo.cropPosition.y}%`,
-                      transform: `scale(${photo.cropPosition.zoom})`,
-                    }}
-                  />
-                </div>
-
-                <div className="flex-1 min-w-0 space-y-2 w-full">
-                  <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                    <span className="font-medium text-slate-800 dark:text-slate-200">
-                      {photo.sourceType === 'uploaded'
-                        ? 'Uploaded Photo'
-                        : photo.sourceType === 'licensed-stock'
-                        ? `Licensed Stock (${photo.license || 'CC'})`
-                        : 'External URL'}
-                    </span>
-                    {photo.isCover && (
+            {photos.map((photo, idx) => {
+              const isVideo = photo.mediaType === 'video';
+              return (
+                <div
+                  key={photo.id}
+                  className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131924] p-3 flex flex-col sm:flex-row gap-3 items-start sm:items-center"
+                >
+                  <div className="w-24 h-20 rounded-lg overflow-hidden bg-slate-900 relative shrink-0">
+                    {isVideo ? (
                       <>
-                        <span aria-hidden="true">·</span>
-                        <span className="text-rose-700 dark:text-rose-400 font-medium">Cover Photo</span>
+                        <video
+                          src={photo.url}
+                          muted
+                          playsInline
+                          preload="metadata"
+                          className="w-full h-full object-cover"
+                        />
+                        <span className="absolute top-1 left-1 px-1.5 py-0.5 rounded bg-black/75 text-white text-[10px] font-medium flex items-center gap-1">
+                          <Film className="w-2.5 h-2.5" />
+                          <span>Video</span>
+                        </span>
                       </>
+                    ) : (
+                      <img
+                        src={photo.url}
+                        alt={photo.caption || 'Selected photo'}
+                        referrerPolicy="no-referrer"
+                        className="w-full h-full object-cover"
+                        style={{
+                          objectPosition: `${photo.cropPosition.x}% ${photo.cropPosition.y}%`,
+                          transform: `scale(${photo.cropPosition.zoom})`,
+                        }}
+                      />
                     )}
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <input
-                      type="text"
-                      value={photo.caption || ''}
-                      onChange={(e) => updatePhoto(photo.id, { caption: e.target.value })}
-                      placeholder="Photo caption..."
-                      className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent text-xs outline-none focus:border-rose-600"
-                    />
-                    <select
-                      value={resolvePhotoTransition(photo.transition)}
-                      onChange={(e) =>
-                        updatePhoto(photo.id, { transition: e.target.value as PhotoTransitionType })
-                      }
-                      aria-label="Per-photo transition"
-                      className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
-                    >
-                      {PHOTO_TRANSITIONS.map((tx) => (
-                        <option key={tx.id} value={tx.id}>
-                          Transition: {tx.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
+                  <div className="flex-1 min-w-0 space-y-2 w-full">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                      <span className="font-medium text-slate-800 dark:text-slate-200">
+                        {photo.sourceType === 'uploaded'
+                          ? isVideo
+                            ? 'Uploaded Video (Cloudinary)'
+                            : 'Uploaded Photo (Cloudinary)'
+                          : photo.sourceType === 'licensed-stock'
+                          ? `Licensed Stock (${photo.license || 'CC'})`
+                          : isVideo
+                          ? 'External Video URL'
+                          : 'External Image URL'}
+                      </span>
+                      {photo.durationSec && (
+                        <span className="font-mono text-[11px]">{photo.durationSec.toFixed(1)}s</span>
+                      )}
+                      {photo.isCover && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-rose-700 dark:text-rose-400 font-medium">Cover Item</span>
+                        </>
+                      )}
+                    </div>
 
-                <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setEditingPhotoId(photo.id)}
-                    className="min-h-[38px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800"
-                  >
-                    Crop &amp; Motion
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCover(photo.id)}
-                    title="Set as cover photo"
-                    className={`min-h-[38px] min-w-[38px] rounded-lg border flex items-center justify-center ${
-                      photo.isCover
-                        ? 'border-rose-600 text-rose-600 bg-rose-50 dark:bg-rose-950/30'
-                        : 'border-slate-200 dark:border-slate-700 text-slate-500'
-                    }`}
-                  >
-                    <Star className="w-3.5 h-3.5" />
-                  </button>
-                  {idx > 0 && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        type="text"
+                        value={photo.caption || ''}
+                        onChange={(e) => updatePhoto(photo.id, { caption: e.target.value })}
+                        placeholder="Caption..."
+                        className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent text-xs outline-none focus:border-rose-600"
+                      />
+                      <select
+                        value={resolvePhotoTransition(photo.transition)}
+                        onChange={(e) =>
+                          updatePhoto(photo.id, { transition: e.target.value as PhotoTransitionType })
+                        }
+                        aria-label="Per-item transition"
+                        className="w-full min-h-[36px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                      >
+                        {PHOTO_TRANSITIONS.map((tx) => (
+                          <option key={tx.id} value={tx.id}>
+                            Transition: {tx.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                    {!isVideo && (
+                      <button
+                        type="button"
+                        onClick={() => setEditingPhotoId(photo.id)}
+                        className="min-h-[38px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800"
+                      >
+                        Crop &amp; Motion
+                      </button>
+                    )}
+                    <label className="min-h-[38px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center cursor-pointer">
+                      <span>Replace</span>
+                      <input
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-m4v"
+                        disabled={uploading}
+                        onChange={(e) => {
+                          handleReplaceMedia(photo.id, e.target.files);
+                          e.target.value = '';
+                        }}
+                        className="hidden"
+                      />
+                    </label>
                     <button
                       type="button"
-                      onClick={() => moveUp(idx)}
-                      title="Move earlier"
-                      className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 flex items-center justify-center"
+                      onClick={() => setCover(photo.id)}
+                      title="Set as cover item"
+                      className={`min-h-[38px] min-w-[38px] rounded-lg border flex items-center justify-center ${
+                        photo.isCover
+                          ? 'border-rose-600 text-rose-600 bg-rose-50 dark:bg-rose-950/30'
+                          : 'border-slate-200 dark:border-slate-700 text-slate-500'
+                      }`}
                     >
-                      <ArrowUp className="w-3.5 h-3.5" />
+                      <Star className="w-3.5 h-3.5" />
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => onChange(photos.filter((p) => p.id !== photo.id))}
-                    title="Remove photo"
-                    className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-200 dark:border-slate-700 text-rose-600 flex items-center justify-center hover:bg-rose-50 dark:hover:bg-rose-950/30"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                    {idx > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => moveItem(idx, -1)}
+                        title="Move earlier"
+                        className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 flex items-center justify-center"
+                      >
+                        <ArrowUp className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    {idx < photos.length - 1 && (
+                      <button
+                        type="button"
+                        onClick={() => moveItem(idx, 1)}
+                        title="Move later"
+                        className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 flex items-center justify-center"
+                      >
+                        <ArrowDown className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => onChange(photos.filter((p) => p.id !== photo.id))}
+                      title="Remove item"
+                      className="min-h-[38px] min-w-[38px] rounded-lg border border-slate-200 dark:border-slate-700 text-rose-600 flex items-center justify-center hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
 
       {/* Crop & Transition Modal */}
-      {editingPhoto && (
+      {editingPhoto && editingPhoto.mediaType !== 'video' && (
         <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="w-full max-w-md rounded-2xl bg-white dark:bg-[#131924] border border-slate-200 dark:border-slate-800 p-5 space-y-4">
             <div className="flex items-center justify-between">

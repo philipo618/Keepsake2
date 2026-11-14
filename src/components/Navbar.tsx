@@ -8,7 +8,7 @@ export type AppRoute =
   | { page: 'create'; editId?: string; templateId?: string; categoryId?: string; openVideoStudio?: boolean }
   | { page: 'dashboard' }
   | { page: 'admin' }
-  | { page: 'greeting'; id: string };
+  | { page: 'greeting'; id: string; keyFragment?: string | null };
 
 export function Navbar({
   route,
@@ -30,7 +30,7 @@ export function Navbar({
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200/80 dark:border-slate-800/80 bg-white/90 dark:bg-[#0B0F17]/90 backdrop-blur-md">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-8">
-        {/* Zone 1: Single clean wordmark */}
+        {/* Zone 1: Clean wordmark */}
         <button
           type="button"
           onClick={() => {
@@ -63,11 +63,11 @@ export function Navbar({
             onClick={() => navigate({ page: 'admin' })}
             className={linkClass(route.page === 'admin')}
           >
-            Admin Login
+            Studio Settings
           </button>
         </nav>
 
-        {/* Zone 3: Single primary action CTA + Mobile drawer toggle */}
+        {/* Zone 3: Primary action CTA + Mobile drawer toggle */}
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
@@ -120,7 +120,7 @@ export function Navbar({
             }}
             className="w-full min-h-[44px] px-3 text-left text-sm font-medium text-slate-800 dark:text-slate-200 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
           >
-            Admin Login
+            Studio Settings
           </button>
         </div>
       )}

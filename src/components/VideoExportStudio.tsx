@@ -28,6 +28,10 @@ import {
 } from '../lib/catalog';
 import { renderMusicToAudioBuffer, StudioAudioSyncPlayer } from '../lib/videoAudioPipeline';
 import {
+  uploadToCloudinaryUnsigned,
+  type UploadProgressInfo,
+} from '../lib/cloudinaryService';
+import {
   buildVideoTimeline,
   detectBrowserVideoCapabilities,
   exportGreetingVideo,
@@ -39,7 +43,6 @@ import {
   type ExportVideoProgress,
   type LoadedImageCache,
 } from '../lib/videoRenderer';
-import { useApp } from './AppContext';
 import type {
   ExportedVideoAttachment,
   Greeting,
@@ -73,7 +76,6 @@ export function VideoExportStudio({
   onUpdateGreeting: (updater: (prev: Greeting) => Greeting) => void;
   onClose: () => void;
 }) {
-  const { user, promptAuth } = useApp();
   const [activeTab, setActiveTab] = useState<StudioTab>('styles');
 
   const config: VideoStudioConfig = useMemo(
@@ -124,11 +126,17 @@ export function VideoExportStudio({
   });
   const [capsChecked, setCapsChecked] = useState(false);
 
-  // Export state
+  // Export & Cloudinary upload state
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<ExportVideoProgress | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportedResult, setExportedResult] = useState<ExportedVideoResult | null>(null);
+  const [audioSourceDurationSec, setAudioSourceDurationSec] = useState<number | undefined>(
+    greeting.musicConfig.durationSec
+  );
+  const [uploadingVideo, setUploadingVideo] = useState(false);
+  const [uploadVideoProgress, setUploadVideoProgress] = useState<UploadProgressInfo | null>(null);
+  const videoUploadAbortRef = useRef<AbortController | null>(null);
 
   // Attach external video URL state
   const [externalVideoUrl, setExternalVideoUrl] = useState('');
@@ -142,6 +150,7 @@ export function VideoExportStudio({
     audioSyncRef.current = new StudioAudioSyncPlayer();
     return () => {
       abortControllerRef.current?.abort();
+      videoUploadAbortRef.current?.abort();
       audioSyncRef.current?.dispose();
       imageCacheRef.current?.release();
       if (exportedUrlRef.current) {
@@ -210,6 +219,13 @@ export function VideoExportStudio({
       (res) => {
         if (!active) return;
         audioSyncRef.current?.setBuffer(res.buffer);
+        if (res.sourceDurationSec) {
+          setAudioSourceDurationSec(res.sourceDurationSec);
+        } else if (greeting.musicConfig.durationSec) {
+          setAudioSourceDurationSec(greeting.musicConfig.durationSec);
+        } else {
+          setAudioSourceDurationSec(undefined);
+        }
         if (res.warning) setAudioWarning(res.warning);
       }
     );
@@ -370,15 +386,64 @@ export function VideoExportStudio({
     abortControllerRef.current?.abort();
   };
 
+  const handleUploadExportedVideoToCloudinary = async () => {
+    if (!exportedResult) return;
+    setExportError(null);
+    setAttachSuccess(null);
+    setUploadingVideo(true);
+    setUploadVideoProgress({ loadedBytes: 0, totalBytes: exportedResult.sizeBytes, percent: 0 });
+    const controller = new AbortController();
+    videoUploadAbortRef.current = controller;
+
+    try {
+      const uploaded = await uploadToCloudinaryUnsigned({
+        file: exportedResult.blob,
+        fileName: exportedResult.fileName,
+        kind: 'video',
+        resourceType: 'video',
+        folder: `keepsake/exports/${greeting.id}`,
+        tags: ['keepsake2', 'exported-video', greeting.id],
+        signal: controller.signal,
+        onProgress: (prog) => setUploadVideoProgress(prog),
+      });
+
+      const attachment: ExportedVideoAttachment = {
+        url: uploaded.secureUrl,
+        format: exportedResult.format,
+        fileName: exportedResult.fileName,
+        durationSec: Math.round(exportedResult.durationSec * 10) / 10,
+        width: exportedResult.width,
+        height: exportedResult.height,
+        sizeBytes: uploaded.bytes || exportedResult.sizeBytes,
+        attachedAt: new Date().toISOString(),
+      };
+      onUpdateGreeting((prev) => ({
+        ...prev,
+        exportedVideo: attachment,
+      }));
+      setAttachSuccess(
+        'Exported video uploaded to Cloudinary CDN and attached to your greeting card!'
+      );
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        setExportError('Cloudinary upload cancelled.');
+      } else {
+        setExportError(
+          err instanceof Error ? err.message : 'Failed to upload exported video to Cloudinary.'
+        );
+      }
+    } finally {
+      setUploadingVideo(false);
+      setUploadVideoProgress(null);
+      videoUploadAbortRef.current = null;
+    }
+  };
+
   const handleAttachExternalVideoUrl = () => {
     if (!exportedResult) return;
-    if (!user) {
-      promptAuth('Sign in to attach a hosted video URL to your greeting card.');
-      return;
-    }
     const clean = externalVideoUrl.trim();
     if (!clean || (!clean.startsWith('https://') && !clean.startsWith('http://'))) {
-      setExportError('Please enter a valid https:// video URL after downloading and hosting your video.');
+      setExportError('Please enter a valid https:// video URL.');
       return;
     }
     setExportError(null);
@@ -1474,17 +1539,38 @@ export function VideoExportStudio({
                       <input
                         type="number"
                         min={5}
-                        max={180}
+                        max={600}
                         placeholder="Auto"
                         value={config.customTotalDurationSec ?? ''}
                         onChange={(e) => {
-                          const v = e.target.value ? Math.max(5, Math.min(180, Number(e.target.value))) : null;
+                          const v = e.target.value ? Math.max(5, Math.min(600, Number(e.target.value))) : null;
                           updateConfig((c) => ({ ...c, customTotalDurationSec: v }));
                         }}
                         className="w-full min-h-[40px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono"
                       />
                     </label>
                   </div>
+
+                  {greeting.musicConfig.enabled && audioSourceDurationSec && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                        Uploaded audio track length: <strong>{audioSourceDurationSec.toFixed(1)}s</strong>
+                        {audioSourceDurationSec > 120 && ' (long renders above 120s work best at 480p/720p)'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateConfig((c) => ({
+                            ...c,
+                            customTotalDurationSec: Math.max(5, Math.min(600, Math.round(audioSourceDurationSec))),
+                          }))
+                        }
+                        className="min-h-[34px] px-3 rounded-lg border border-rose-300 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-[11px] font-medium hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                      >
+                        Match Full Audio ({Math.round(audioSourceDurationSec)}s)
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* Export Trigger & Progress */}
@@ -1582,18 +1668,59 @@ export function VideoExportStudio({
                       )}
 
                       <div className="space-y-2.5">
-                        <a
-                          href={exportedResult.url}
-                          download={exportedResult.fileName}
-                          className="w-full min-h-[44px] px-4 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-semibold flex items-center justify-center gap-2"
-                        >
-                          <Download className="w-4 h-4" />
-                          <span>Download Video ({exportedResult.format.toUpperCase()})</span>
-                        </a>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <a
+                            href={exportedResult.url}
+                            download={exportedResult.fileName}
+                            className="w-full min-h-[44px] px-4 rounded-xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-semibold flex items-center justify-center gap-2"
+                          >
+                            <Download className="w-4 h-4" />
+                            <span>Download ({exportedResult.format.toUpperCase()})</span>
+                          </a>
+
+                          <button
+                            type="button"
+                            disabled={uploadingVideo}
+                            onClick={handleUploadExportedVideoToCloudinary}
+                            className="w-full min-h-[44px] px-4 rounded-xl bg-rose-700 hover:bg-rose-800 text-white text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-50"
+                          >
+                            <UploadCloud className="w-4 h-4" />
+                            <span>
+                              {uploadingVideo
+                                ? `Uploading ${uploadVideoProgress?.percent ?? 0}%...`
+                                : 'Upload to Cloudinary & Attach'}
+                            </span>
+                          </button>
+                        </div>
+
+                        {uploadingVideo && uploadVideoProgress && (
+                          <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-2.5 space-y-1.5">
+                            <div className="flex items-center justify-between text-[11px]">
+                              <span>
+                                {uploadVideoProgress.totalChunks
+                                  ? `Uploading chunk ${uploadVideoProgress.chunkIndex}/${uploadVideoProgress.totalChunks}...`
+                                  : 'Uploading exported video to Cloudinary CDN...'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => videoUploadAbortRef.current?.abort()}
+                                className="text-rose-600 font-medium hover:underline"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                            <div className="h-1.5 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                              <div
+                                className="h-full bg-rose-700"
+                                style={{ width: `${uploadVideoProgress.percent}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
 
                         <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/50 p-3 space-y-2">
                           <p className="text-[11px] text-slate-600 dark:text-slate-300">
-                            Cloud video hosting requires paid Storage on Firebase. Download your video above for free, or optionally paste an externally hosted MP4/WebM URL to attach it to the card:
+                            Or paste an externally hosted MP4/WebM URL to attach it to the card:
                           </p>
                           <div className="flex flex-col sm:flex-row gap-2">
                             <input

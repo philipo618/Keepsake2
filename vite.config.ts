@@ -5,7 +5,7 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 
 export default defineConfig(({ mode }) => {
-  const defaultBase = mode === 'production' ? '/Keepsake/' : '/';
+  const defaultBase = mode === 'production' ? '/Keepsake2/' : '/';
   const rawBase = process.env.VITE_BASE_PATH || defaultBase;
   const basePath = rawBase.endsWith('/') ? rawBase : `${rawBase}/`;
   const segmentCount = basePath.split('/').filter(Boolean).length;

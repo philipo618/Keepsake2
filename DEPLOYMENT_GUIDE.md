@@ -1,62 +1,72 @@
-# Keepsake — Static GitHub Pages Deployment Guide (`/Keepsake/`)
+# Keepsake2 — Static GitHub Pages & Cloudinary Deployment Guide (`/Keepsake2/`)
 
-## 100% Free Static Hosting Architecture (No Cloud Billing)
-Keepsake runs completely as a static React SPA on **GitHub Pages** (`https://<username>.github.io/Keepsake/`) connected directly to **Firebase Authentication** and **Cloud Firestore** on project **`project-b53c6fb8-7eac-4068-a82`** (Spark free tier):
-- **Zero Server Infrastructure**: No Express server, no Cloud Run, no Cloud Functions, and no Firebase Hosting or paid Firebase Storage.
-- **Mode A & Mode B Interactive Verification**:
-  - Mode A opens immediately via `/Keepsake/g/:id`.
-  - Mode B encrypts the greeting message, notes, signature, photos, and optional video metadata in-browser using Web Crypto API (`PBKDF2-SHA256` at 150,000 iterations + `AES-256-GCM` authenticated with `additionalData = greetingId`). Plaintext secrets stay in creator-only `greetings/{id}/secrets/verification`, while recipients verify and decrypt locally against `greetings/{id}/vault/sealed`.
-- **Media Compression & Local Video Export**:
-  - Uploaded device photos are compressed via HTML5 `<canvas>` into Firestore-safe JPEG Data URLs (with a `900 KB` document payload cap).
-  - Audio clips up to `450 KB` embed inline; larger audio tracks can use the Built-In Studio Music Library or an External Audio URL.
-  - Video Export Studio renders `.mp4` (WebCodecs + `mp4-muxer`) and `.webm` (`MediaRecorder`) locally in the browser and downloads directly to the user's device.
+## 100% Serverless Static Architecture (Zero Backend & Zero Database)
+Keepsake2 runs completely as a static React SPA on **GitHub Pages** (`https://<username>.github.io/Keepsake2/`) using:
+- **Cloud Media & Card JSON Hosting**: **Cloudinary** direct browser unsigned uploads (`https://api.cloudinary.com/v1_1/<cloud_name>/<resource_type>/upload`).
+- **Local Browser Persistence**: **IndexedDB** (`keepsake_studio_v2`) for auto-saved drafts, interrupted session recovery, temporary media blobs, published link history, studio catalog defaults, and sanitized upload logs.
+- **Browser Media Processing**: HTML5 `<canvas>`, Web Audio API, `MediaRecorder`, `mp4-muxer` / WebCodecs, and Web Crypto API (`AES-256-GCM`).
+- **GitHub Pages Routing**: Client-side hash routes (`#/`, `#/explore`, `#/create`, `#/studio`, `#/admin`, `#/view/<id>`, `#/view/<id>#key=<base64url>`) paired with `public/404.html` redirect restoration.
+- **Zero Backend Infrastructure**: No Firebase, no Firestore, no Express server, no Cloud Run, no Cloud Functions, and no database servers.
 
 ---
 
-## Step 1: Verify Firebase Project & Security Rules (`project-b53c6fb8-7eac-4068-a82`)
-1. Open the [Firebase Console](https://console.firebase.google.com/) and select **`project-b53c6fb8-7eac-4068-a82`**.
-2. Confirm **Cloud Firestore** database `ai-studio-4f3bd88e-95e5-4469-8be1-a33cea212c13` is active on the **Spark (Free)** plan.
-3. Deploy `firestore.rules` (only needed when rules change; does not use Firebase Hosting):
-   ```bash
-   npx eslint firestore.rules
-   firebase login
-   firebase deploy --only firestore:rules
-   ```
+## Step 1: Create a Free Cloudinary Account & Unsigned Upload Preset
+1. Sign up or log in at [Cloudinary Console](https://console.cloudinary.com/).
+2. Copy your **Cloud name** from the Dashboard (e.g. `my-keepsake-cloud`).
+3. Open **Settings → Upload → Upload presets** and click **Add upload preset**:
+   - **Upload preset name**: `Keepsake2` (verified unsigned preset on cloud `jbo6hxur`)
+   - **Signing Mode**: **Unsigned** *(mandatory for browser-only uploads without an API secret)*
+   - **Asset folder** *(optional)*: `keepsake`
+   - **Use filename or externally defined Public ID**: **Enabled** *(confirmed working on `Keepsake2` so published card JSON URLs resolve cleanly via `/view/<cardId>`; if randomized public IDs are ever enforced, Keepsake2 automatically encodes `p_<base64url>` in the share link)*
+   - **Unique filename**: **Disabled** if using externally defined Public IDs for cards, or **Enabled** alongside folder settings (Keepsake2 handles custom public IDs seamlessly)
+   - **Allowed formats** *(recommended free-tier allowlist)*: `jpg, jpeg, png, webp, gif, mp4, webm, mov, mp3, wav, m4a, aac, ogg, json`
+   - **Overwrite**: Disabled (prevents overwriting published cards; Keepsake2 mints a fresh `cardId` automatically when re-publishing edits)
+   - **Raw file delivery**: Allowed (`json` uploads use Cloudinary `raw` resource delivery so published cards load directly from `res.cloudinary.com`)
+4. **Security Rule**: Never place your Cloudinary `API Secret` in `.env`, GitHub Actions, or browser code. Unsigned browser uploads only ever use `VITE_CLOUDINARY_CLOUD_NAME` and `VITE_CLOUDINARY_UPLOAD_PRESET`.
 
-## Step 2: Authorize Your GitHub Pages Domain in Firebase Auth
-1. In **Firebase Console → Build → Authentication → Sign-in method**, confirm **Google** (and optionally **Anonymous**) is enabled.
-2. Go to **Build → Authentication → Settings → Authorized domains** and add your GitHub Pages hostname (domain only, without `/Keepsake`):
-   - `YOUR-USERNAME.github.io`
-   *(Without adding your `.github.io` domain, Google Sign-In popups will be rejected by Firebase Auth with `auth/unauthorized-domain`.)*
+---
 
-## Step 3: Push Code to Your GitHub Repository (`Keepsake`)
+## Step 2: Configure Environment Variables
+
+### Local Development (`.env.local`)
+Copy `.env.example` to `.env.local` (pre-populated with your verified public values):
 ```bash
-git init
+VITE_CLOUDINARY_CLOUD_NAME="jbo6hxur"
+VITE_CLOUDINARY_UPLOAD_PRESET="Keepsake2"
+```
+*(You can also configure or override Cloudinary credentials at runtime in **Studio Settings** at `#/admin`.)*
+
+### GitHub Repository Variables (for GitHub Actions)
+In your GitHub repository **Settings → Secrets and variables → Actions → Variables** (or **Secrets**), you can optionally override:
+- `VITE_CLOUDINARY_CLOUD_NAME`: defaults to `jbo6hxur`
+- `VITE_CLOUDINARY_UPLOAD_PRESET`: defaults to `Keepsake2`
+- `VITE_BASE_PATH` *(optional)*: `/Keepsake2/` (auto-detected from repository name by `.github/workflows/deploy-gh-pages.yml`)
+
+---
+
+## Step 3: Push Code & Enable GitHub Pages
+```bash
 git add .
-git commit -m "Configure Keepsake for static GitHub Pages (/Keepsake/) deployment"
+git commit -m "Deploy Keepsake2 static app with Cloudinary and IndexedDB"
 git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/Keepsake.git
 git push -u origin main
 ```
-
-## Step 4: Enable GitHub Pages (GitHub Actions)
-1. Open your GitHub repository **Settings → Pages**.
+1. Open **Settings → Pages** in your GitHub repository.
 2. Set **Source** to **GitHub Actions**.
-3. The included `.github/workflows/deploy-gh-pages.yml` workflow automatically:
-   - Installs npm dependencies
-   - Runs `npm run lint` (`tsc --noEmit`)
-   - Builds `dist/` with `base: "/Keepsake/"` (and sets `dist/404.html` `pathSegmentsToKeep = 1`)
-   - Publishes `dist/` to GitHub Pages
-4. Wait for the **Deploy Keepsake to GitHub Pages** workflow to complete and open `https://YOUR-USERNAME.github.io/Keepsake/`.
+3. Wait for the **Deploy Keepsake2 to GitHub Pages** workflow to install (`npm ci`), typecheck (`npm run lint`), build (`npm run build` -> `dist/`), and publish to `https://<username>.github.io/Keepsake2/`.
 
-## Step 5: Post-Deployment Verification Checklist
-1. Open `https://YOUR-USERNAME.github.io/Keepsake/` and verify images, CSS, and navigation render cleanly.
-2. Refresh directly on `/Keepsake/explore`, `/Keepsake/create`, `/Keepsake/studio`, and `/Keepsake/g/<id>` to confirm `404.html` SPA fallback restores routes without 404 errors.
-3. Sign in at `/Keepsake/admin` via Google Auth as the bootstrapped administrator (`dicksonphilipo63@gmail.com`) and click **Seed Default Catalog**.
-4. Confirm non-admin Google accounts visiting `/Keepsake/admin` receive **Access Denied**.
-5. Publish a Mode B card, open `/Keepsake/g/<id>` in a fresh incognito window, confirm wrong answers fail, and confirm valid answers decrypt the card.
+---
 
-## Known Static Hosting Limitations
-- **Cloud Media Blob Hosting**: Multi-megabyte audio tracks (>450 KB), large high-resolution photo collections exceeding Firestore's 1 MiB document ceiling, and exported `.mp4`/`.webm` video files cannot be uploaded to server storage without paid Storage/CDN; exported videos download locally to the creator's device, and external HTTPS URLs are supported for larger audio/video assets.
-- **Client-Side Mode B Brute-Force Bounds**: Retry lockouts (`3`/`5`/`10` attempts -> 60s pause) are enforced per-browser via `localStorage` rather than a centralized server rate-limiter; creators should include a custom memory question alongside birthdates for higher entropy.
-- **No Server-Side Dynamic OpenGraph Previews**: Social crawlers (WhatsApp/Facebook link unfurlers) receive static meta tags from `index.html` rather than per-card dynamic OG tags.
+## Step 4: Post-Deployment Verification
+1. Open `https://<username>.github.io/Keepsake2/` and verify routes `#/explore`, `#/create`, `#/studio`, and `#/admin` load without 404 or console errors.
+2. Open `#/admin` (**Studio Settings**) and run **Test Cloudinary Connection** to confirm your preset allows unsigned browser uploads.
+3. Publish a **Mode A** greeting card, open the share URL in an incognito browser window, and verify photos, video, audio, and message render cleanly.
+4. Publish a **Mode B** encrypted greeting card, open `#/view/<id>#key=<key>` in an incognito browser window, verify decryption succeeds, and verify that removing or altering `#key=` blocks decryption cleanly.
+
+---
+
+## Known Static Architecture Constraints
+- **Cloudinary Free Tier File Size Limits**: Single image and raw JSON files are capped at **10 MB**; single audio/video files are capped at **100 MB** (files larger than 20 MB automatically use 6 MB chunked Cloudinary uploads).
+- **Mode B Share Link Sensitivity**: In Mode B, the `AES-256-GCM` decryption key resides strictly in the URL `#key=` fragment (`#/view/<id>#key=...`) and is never sent to Cloudinary or any server. Recipients need the full link containing `#key=` (or the quiz hint if enabled) to decrypt the card.
+- **No Global Cross-Device Draft Sync**: Drafts and published link history reside locally in IndexedDB unless exported as JSON backups from Studio Settings (`#/admin`).
+- **Static Social Link Previews**: Crawlers unfurling shared URLs read the static OpenGraph tags from `index.html` rather than per-card server-rendered previews.

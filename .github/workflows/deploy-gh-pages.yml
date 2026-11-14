@@ -1,4 +1,4 @@
-name: Deploy Keepsake to GitHub Pages
+name: Deploy Keepsake2 to GitHub Pages
 
 on:
   push:
@@ -35,7 +35,9 @@ jobs:
 
       - name: Build production bundle for GitHub Pages
         env:
-          VITE_BASE_PATH: ${{ vars.VITE_BASE_PATH || (github.event.repository.name == format('{0}.github.io', github.repository_owner) && '/' || format('/{0}/', github.event.repository.name)) || '/Keepsake/' }}
+          VITE_BASE_PATH: ${{ vars.VITE_BASE_PATH || (github.event.repository.name == format('{0}.github.io', github.repository_owner) && '/' || format('/{0}/', github.event.repository.name)) || '/Keepsake2/' }}
+          VITE_CLOUDINARY_CLOUD_NAME: ${{ vars.VITE_CLOUDINARY_CLOUD_NAME || secrets.VITE_CLOUDINARY_CLOUD_NAME || 'jbo6hxur' }}
+          VITE_CLOUDINARY_UPLOAD_PRESET: ${{ vars.VITE_CLOUDINARY_UPLOAD_PRESET || secrets.VITE_CLOUDINARY_UPLOAD_PRESET || 'Keepsake2' }}
         run: npm run build
 
       - name: Setup Pages

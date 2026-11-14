@@ -112,7 +112,7 @@ export function LandingPage({ navigate }: { navigate: (next: AppRoute) => void }
               </div>
               <div className="flex items-center gap-3">
                 <Lock className="w-4 h-4 text-rose-700 dark:text-rose-400 shrink-0" />
-                <span>Protected backend answer verification for birthday &amp; secret gates</span>
+                <span>End-to-end encrypted Mode B cards &amp; optional birthday gates</span>
               </div>
             </div>
           </div>
@@ -274,10 +274,10 @@ export function LandingPage({ navigate }: { navigate: (next: AppRoute) => void }
           </div>
           <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2">
             <h3 className="text-base font-semibold text-slate-900 dark:text-white">
-              02. Add Photos, Music &amp; Motion
+              02. Add Photos, Video, Music &amp; Motion
             </h3>
             <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-              Upload and crop personal photos, select licensed stock imagery, add MP3/WAV or studio music, and layer up to 16 smooth animations.
+              Upload photos, video clips, or full-length MP3/WAV audio to Cloudinary CDN, select licensed artwork, and layer up to 16 smooth animations.
             </p>
           </div>
           <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2">
@@ -285,7 +285,7 @@ export function LandingPage({ navigate }: { navigate: (next: AppRoute) => void }
               03. Configure Access &amp; Share
             </h3>
             <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-              Publish with direct access or interactive birthday/memory verification, then send your unique URL via WhatsApp, Telegram, or Email.
+              Publish Mode A public links or Mode B client-side AES-256-GCM encrypted cards, then share via WhatsApp, Telegram, or Email.
             </p>
           </div>
         </div>
@@ -297,7 +297,7 @@ export function LandingPage({ navigate }: { navigate: (next: AppRoute) => void }
               Ready to craft a gift someone will keep?
             </h3>
             <p className="text-sm text-slate-600 dark:text-slate-400">
-              Create your greeting card in minutes, browse ready-made templates, or manage platform assets via authorized administrator login.
+              Create your greeting card in minutes, browse ready-made templates, or configure Cloudinary settings &amp; diagnostics locally.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -321,7 +321,7 @@ export function LandingPage({ navigate }: { navigate: (next: AppRoute) => void }
               className="min-h-[44px] px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white flex items-center gap-1.5"
             >
               <ShieldCheck className="w-4 h-4" />
-              <span>Admin Login</span>
+              <span>Studio Settings</span>
             </button>
           </div>
         </div>

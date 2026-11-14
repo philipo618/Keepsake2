@@ -1,120 +1,164 @@
-import { auth } from './firebase';
+import {
+  uploadMediaAssetToCloudinary,
+  type UploadProgressInfo,
+} from './cloudinaryService';
+import { saveLocalMediaBlob } from './indexedDbService';
 
-const MAX_INLINE_IMAGE_BYTES = 180_000;
-const MAX_INLINE_AUDIO_BYTES = 450_000;
-
-export async function compressImageFile(
+/**
+ * Optional client-side image optimization helper before Cloudinary upload
+ * (keeps dimensions sensible for mobile cards while maintaining crisp visual quality).
+ */
+export async function optimizeImageForWeb(
   file: File,
-  maxDimension = 1080,
-  quality = 0.78
-): Promise<{ dataUrl: string; blob: Blob }> {
-  return new Promise((resolve, reject) => {
+  maxDimension = 1920,
+  quality = 0.88
+): Promise<File> {
+  // Preserve animated GIFs and small WebP/PNG/JPEG files directly
+  if (file.type === 'image/gif' || file.size <= 400_000) {
+    return file;
+  }
+
+  return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const renderAt = (dim: number, q: number, mime: string) => {
-          let { width, height } = img;
-          if (width > dim || height > dim) {
-            const ratio = Math.min(dim / width, dim / height);
-            width = Math.max(1, Math.round(width * ratio));
-            height = Math.max(1, Math.round(height * ratio));
-          }
-          const canvas = document.createElement('canvas');
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) return null;
-          ctx.drawImage(img, 0, 0, width, height);
-          const dataUrl = canvas.toDataURL(mime, q);
-          return { canvas, dataUrl };
-        };
-
-        const initialMime = file.type === 'image/png' ? 'image/jpeg' : 'image/jpeg';
-        let attempt = renderAt(maxDimension, quality, initialMime);
-        if (!attempt) {
-          reject(new Error('Canvas context unavailable'));
+        let { width, height } = img;
+        if (width <= maxDimension && height <= maxDimension && file.size <= 3_500_000) {
+          resolve(file);
           return;
         }
-
-        // Step down gently if encoded data URL exceeds Firestore-friendly inline budget
-        const steps: Array<[number, number]> = [
-          [960, 0.72],
-          [800, 0.66],
-          [640, 0.6],
-        ];
-        for (const [dim, q] of steps) {
-          if (attempt.dataUrl.length <= MAX_INLINE_IMAGE_BYTES * 1.37) break;
-          const next = renderAt(dim, q, 'image/jpeg');
-          if (next) attempt = next;
+        if (width > maxDimension || height > maxDimension) {
+          const ratio = Math.min(maxDimension / width, maxDimension / height);
+          width = Math.max(1, Math.round(width * ratio));
+          height = Math.max(1, Math.round(height * ratio));
         }
-
-        const finalDataUrl = attempt.dataUrl;
-        attempt.canvas.toBlob(
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        const targetMime = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+        canvas.toBlob(
           (blob) => {
-            if (!blob) {
-              reject(new Error('Failed to compress image'));
+            if (!blob || blob.size >= file.size) {
+              resolve(file);
               return;
             }
-            resolve({ dataUrl: finalDataUrl, blob });
+            resolve(
+              new File([blob], file.name, {
+                type: targetMime,
+                lastModified: Date.now(),
+              })
+            );
           },
-          'image/jpeg',
+          targetMime,
           quality
         );
       };
-      img.onerror = () => reject(new Error('Could not decode image file'));
+      img.onerror = () => resolve(file);
       img.src = String(reader.result);
     };
-    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.onerror = () => resolve(file);
     reader.readAsDataURL(file);
   });
 }
 
-export async function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(new Error('Failed to read file'));
-    reader.readAsDataURL(file);
+export async function probeAudioDurationSec(file: Blob): Promise<number | undefined> {
+  if (typeof document === 'undefined') return undefined;
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const audio = document.createElement('audio');
+    audio.preload = 'metadata';
+    const cleanup = () => {
+      audio.src = '';
+      URL.revokeObjectURL(objectUrl);
+    };
+    audio.onloadedmetadata = () => {
+      const dur = Number.isFinite(audio.duration) ? Math.round(audio.duration * 10) / 10 : undefined;
+      cleanup();
+      resolve(dur);
+    };
+    audio.onerror = () => {
+      cleanup();
+      resolve(undefined);
+    };
+    audio.src = objectUrl;
+  });
+}
+
+export async function probeVideoDurationSec(file: Blob): Promise<number | undefined> {
+  if (typeof document === 'undefined') return undefined;
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    const cleanup = () => {
+      video.src = '';
+      URL.revokeObjectURL(objectUrl);
+    };
+    video.onloadedmetadata = () => {
+      const dur = Number.isFinite(video.duration) ? Math.round(video.duration * 10) / 10 : undefined;
+      cleanup();
+      resolve(dur);
+    };
+    video.onerror = () => {
+      cleanup();
+      resolve(undefined);
+    };
+    video.src = objectUrl;
   });
 }
 
 /**
- * Spark-plan billing-free media processor:
- * - Images are resized and compressed in-browser into Firestore-safe JPEG Data URLs.
- * - Short audio clips (<= 450 KB) are embedded directly; larger audio tracks require
- *   an External Audio URL or the built-in Studio Music Library (no paid Storage bucket needed).
+ * Saves temporary local copy in IndexedDB for draft recovery, then uploads to Cloudinary.
  */
 export async function uploadMediaFile(
   file: File,
-  _greetingId: string,
-  kind: 'image' | 'audio'
-): Promise<{ url: string; sizeBytes: number; storageProvider: 'firestore-inline' }> {
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error('Please sign in before adding media from your device.');
+  greetingId: string,
+  kind: 'image' | 'video' | 'audio',
+  options?: {
+    signal?: AbortSignal;
+    onProgress?: (progress: UploadProgressInfo) => void;
+    optimizeImages?: boolean;
   }
+): Promise<{
+  url: string;
+  publicId: string;
+  sizeBytes: number;
+  format: string;
+  durationSec?: number;
+  localBlobId: string;
+}> {
+  const localRec = await saveLocalMediaBlob(greetingId, kind, file, file.name);
+  const fileToUpload =
+    kind === 'image' && options?.optimizeImages !== false
+      ? await optimizeImageForWeb(file)
+      : file;
 
-  if (kind === 'image') {
-    const compressed = await compressImageFile(file);
-    return {
-      url: compressed.dataUrl,
-      sizeBytes: compressed.dataUrl.length,
-      storageProvider: 'firestore-inline',
-    };
-  }
+  const probedDuration =
+    kind === 'audio'
+      ? await probeAudioDurationSec(file)
+      : kind === 'video'
+      ? await probeVideoDurationSec(file)
+      : undefined;
 
-  if (file.size > MAX_INLINE_AUDIO_BYTES) {
-    throw new Error(
-      `This audio file (${(file.size / 1024).toFixed(0)} KB) exceeds the 450 KB limit for free Firestore-only hosting. Use a shorter clip, choose a track from the Built-In Studio Music Library, or paste an External Audio URL.`
-    );
-  }
+  const uploaded = await uploadMediaAssetToCloudinary(fileToUpload, kind, greetingId, {
+    signal: options?.signal,
+    onProgress: options?.onProgress,
+  });
 
-  const dataUrl = await fileToDataUrl(file);
   return {
-    url: dataUrl,
-    sizeBytes: dataUrl.length,
-    storageProvider: 'firestore-inline',
+    url: uploaded.secureUrl,
+    publicId: uploaded.publicId,
+    sizeBytes: uploaded.bytes,
+    format: uploaded.format,
+    durationSec: uploaded.duration ?? probedDuration,
+    localBlobId: localRec.id,
   };
 }
 
@@ -128,7 +172,7 @@ export interface StockPhotoResult {
 }
 
 /**
- * Legitimate public Wikimedia Commons API search returning openly licensed
+ * Public Wikimedia Commons API search returning openly licensed
  * (Creative Commons / Public Domain) photography with real license & author metadata.
  */
 export async function searchLicensedStockPhotos(query: string): Promise<StockPhotoResult[]> {
@@ -179,7 +223,9 @@ export async function searchLicensedStockPhotos(query: string): Promise<StockPho
     const info = page.imageinfo?.[0];
     if (!info?.thumburl || !info.url) continue;
     if (info.mime && !info.mime.startsWith('image/')) continue;
-    const rawArtist = info.extmetadata?.Artist?.value?.replace(/<[^>]+>/g, '').trim() || 'Wikimedia Commons Contributor';
+    const rawArtist =
+      info.extmetadata?.Artist?.value?.replace(/<[^>]+>/g, '').trim() ||
+      'Wikimedia Commons Contributor';
     const license = info.extmetadata?.LicenseShortName?.value || 'CC / Public Domain';
     results.push({
       id: String(page.pageid),

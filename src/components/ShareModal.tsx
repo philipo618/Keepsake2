@@ -1,25 +1,40 @@
-import { Check, Copy, Mail, Share2 } from 'lucide-react';
+import { Check, Copy, Lock, Mail, Share2 } from 'lucide-react';
 import { useState } from 'react';
 
-export function buildGreetingShareUrl(greetingId: string): string {
+export function buildGreetingShareUrl(
+  cardId: string,
+  encryptionKeyFragment?: string | null
+): string {
   const base = import.meta.env.BASE_URL || '/';
   const normalizedBase = base.endsWith('/') ? base : `${base}/`;
-  return `${window.location.origin}${normalizedBase}g/${greetingId}`;
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  const baseRoute = `${origin}${normalizedBase}#/view/${encodeURIComponent(cardId)}`;
+  if (encryptionKeyFragment && encryptionKeyFragment.trim()) {
+    return `${baseRoute}#key=${encodeURIComponent(encryptionKeyFragment.trim())}`;
+  }
+  return baseRoute;
 }
 
 export function ShareModal({
   greetingId,
   recipientName,
   title,
+  shareUrlOverride,
+  encryptionKey,
+  isEncrypted = false,
   onClose,
 }: {
   greetingId: string;
   recipientName: string;
   title: string;
+  shareUrlOverride?: string;
+  encryptionKey?: string | null;
+  isEncrypted?: boolean;
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
-  const shareUrl = buildGreetingShareUrl(greetingId);
+  const shareUrl =
+    shareUrlOverride || buildGreetingShareUrl(greetingId, encryptionKey);
   const shareText = `I created a special digital greeting card for ${recipientName}: "${title}"`;
 
   const handleCopy = async () => {
@@ -75,6 +90,15 @@ export function ShareModal({
             ✕
           </button>
         </div>
+
+        {(isEncrypted || Boolean(encryptionKey)) && (
+          <div className="mb-4 rounded-xl border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/30 p-3 text-xs text-emerald-900 dark:text-emerald-200 flex items-start gap-2">
+            <Lock className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>
+              <strong>Mode B Private Card (AES-256-GCM):</strong> The decryption key is embedded strictly inside the <code className="font-mono">#key=...</code> URL fragment and was never uploaded to Cloudinary. Share the full link—opening the card without the fragment key will be rejected.
+            </span>
+          </div>
+        )}
 
         <div className="flex items-center gap-2 p-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900">
           <input
